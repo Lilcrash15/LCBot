@@ -5,6 +5,11 @@ All notable changes to LCBot are logged here. Versions follow
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-29
+
+No functional changes -- first version actually published as a
+GitHub release (v0.1.0 was tagged but never published).
+
 ## [0.1.0] - 2026-08-29
 
 First tagged build.

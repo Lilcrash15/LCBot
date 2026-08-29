@@ -6,4 +6,4 @@ song requests, and quotes -- all editable from a GUI, all data stored
 locally in SQLite.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
