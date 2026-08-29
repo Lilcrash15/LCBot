@@ -88,24 +88,19 @@ Everything above is editable live from the GUI (Commands, Currency,
 Moderation, Timers, Song Requests, Quotes, Users tabs) -- nothing
 requires editing files by hand.
 
-## Requirements
-
-- Python 3.10 or newer (tested on 3.11/3.12). Get it from
-  [python.org](https://www.python.org/downloads/) -- on Windows, check
-  "Add python.exe to PATH" during install, and tkinter (the GUI
-  toolkit) is included automatically.
-- No third-party packages -- see `requirements.txt`.
-
 ## Setup
 
-### 1. Run it
+### 1. Download and run
 
-```
-python run_bot.py
-```
+Grab `TwitchChatBotV2.exe` from the [Releases](../../releases) page
+(newest version at the top) and run it -- no Python install needed,
+nothing else to set up first. The first time it runs it creates a
+blank `config.json` (connection settings) and `chatbot.db` (everything
+else) next to itself. Every field starts empty; nothing is pre-filled,
+so it's ready for anyone downloading it fresh.
 
-This creates `config.json` (connection settings) and `chatbot.db`
-(everything else) next to the script the first time you run it.
+(If you'd rather run it from source instead of the compiled exe, see
+[Running from source](#running-from-source-optional) near the bottom.)
 
 ### 2. Create a bot account (optional but recommended)
 
@@ -209,6 +204,24 @@ currency math, moderation filters, IRC tag parsing, DB):
 ```
 python -m unittest discover -s tests -v
 ```
+
+## Running from source (optional)
+
+Only needed if you want to modify the code, or run it without the
+compiled exe:
+
+- Python 3.10 or newer (tested on 3.11/3.12). Get it from
+  [python.org](https://www.python.org/downloads/) -- on Windows, check
+  "Add python.exe to PATH" during install, and tkinter (the GUI
+  toolkit) is included automatically.
+- No third-party packages -- see `requirements.txt`.
+
+```
+python run_bot.py
+```
+
+This creates `config.json` and `chatbot.db` next to the script the
+first time you run it, same as the compiled exe does next to itself.
 
 ## Architecture, if you want to extend it
 

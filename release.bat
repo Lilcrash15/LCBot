@@ -26,6 +26,13 @@ if "%VERSION%"=="" (
     exit /b 1
 )
 
+git rev-parse "%VERSION%" >nul 2>nul
+if not errorlevel 1 (
+    echo.
+    echo Tag %VERSION% already exists locally -- skipping the "git tag" step.
+    goto push_tag
+)
+
 echo.
 echo Reminder: bump __version__ in chatbot\__init__.py and add a
 echo CHANGELOG.md entry for %VERSION% BEFORE running this, if you
@@ -41,19 +48,55 @@ if /i not "%CONFIRM%"=="y" (
 
 git tag %VERSION%
 if errorlevel 1 (
-    echo Tagging failed -- does that tag already exist? ^(git tag -l to check^)
+    echo Tagging failed -- see the error above.
     pause
     exit /b 1
 )
-git push origin %VERSION%
 
+:push_tag
+rem Always push, even if the tag already existed locally -- it may exist
+rem locally but not (or no longer) on GitHub, and pushing an already-synced
+rem tag is a harmless no-op ("Everything up-to-date").
+echo.
+echo Making sure %VERSION% is pushed to GitHub...
+git push origin %VERSION%
+if errorlevel 1 (
+    echo.
+    echo === Pushing the tag failed -- see the error above ===
+    echo Common causes: not signed in, cancelled the sign-in popup, or no
+    echo write access to this repo under this GitHub account.
+    pause
+    exit /b 1
+)
 where gh >nul 2>nul
 if errorlevel 1 (
     echo.
     echo GitHub CLI ^(gh^) not found -- the tag is pushed, but you'll need to
     echo draft the release by hand: go to your repo's Releases page on
-    echo github.com, click "Draft a new release", pick tag %VERSION%, and
+    echo github.com, click "Create a new release", pick tag %VERSION%, and
     echo publish it. If dist\TwitchChatBotV2.exe exists, attach it there too.
+    echo.
+    echo ^(Installing gh from https://cli.github.com/ lets this script do
+    echo  all of that for you automatically next time.^)
+    pause
+    exit /b 0
+)
+
+echo.
+echo Checking gh sign-in...
+gh auth status >nul 2>nul
+if errorlevel 1 (
+    echo Not signed in yet. Opening browser sign-in via GitHub CLI...
+    echo ^(This is between you and GitHub -- nothing is typed here.^)
+    gh auth login --web -h github.com
+)
+
+gh release view %VERSION% >nul 2>nul
+if not errorlevel 1 (
+    echo.
+    echo A release for %VERSION% already exists on GitHub -- nothing more
+    echo to do. Go check github.com/^<you^>/LCBot/releases if you want to
+    echo edit it or attach a different file.
     pause
     exit /b 0
 )
@@ -68,7 +111,13 @@ if exist dist\TwitchChatBotV2.exe (
     echo release without it for now...
     gh release create %VERSION% --title "%VERSION%" --generate-notes
 )
+if errorlevel 1 (
+    echo.
+    echo === Creating the release failed -- see the error above ===
+    pause
+    exit /b 1
+)
 
 echo.
-echo === Done ===
+echo === Done -- check github.com/^<you^>/LCBot/releases ===
 pause
