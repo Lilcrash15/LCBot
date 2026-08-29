@@ -1,0 +1,6 @@
+# No third-party dependencies -- everything runs on the Python 3.10+
+# standard library (sqlite3, tkinter, ssl/socket, urllib, http.server).
+#
+# On Windows, tkinter ships with the standard python.org installer.
+# On Linux, install your distro's tk package if it's not already there
+# (e.g. `sudo apt install python3-tk` on Debian/Ubuntu).

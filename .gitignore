@@ -1,0 +1,21 @@
+config.json
+chatbot.db
+chatbot.db-wal
+chatbot.db-shm
+song_overlay_state.json
+__pycache__/
+*.pyc
+
+# PyInstaller build output -- rebuilt from source by build_exe.bat,
+# no reason to version the generated exe/intermediate files.
+build/
+dist/
+
+# Downloaded/cached at runtime, not source.
+emote_cache/
+
+# Local editor/OS cruft.
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

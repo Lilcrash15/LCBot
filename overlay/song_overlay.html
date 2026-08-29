@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Song Request Overlay</title>
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  #player-wrap {
+    position: fixed; bottom: 16px; right: 16px; width: 480px;
+    font-family: "Segoe UI", Arial, sans-serif; color: #fff;
+  }
+  #player { width: 480px; height: 270px; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+  #info { margin-top: 8px; background: rgba(0,0,0,0.55); border-radius: 8px;
+    padding: 8px 12px; font-size: 14px; }
+  #title { font-weight: 600; }
+  #requester { opacity: 0.75; font-size: 12px; }
+  #empty { font-size: 14px; opacity: 0.8; padding: 12px; }
+</style>
+</head>
+<body>
+<div id="player-wrap">
+  <div id="player"></div>
+  <div id="info">
+    <div id="title">Waiting for a song request...</div>
+    <div id="requester"></div>
+  </div>
+</div>
+
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+  // Point this at the state file the bot writes next to the queue DB.
+  // Change this if you keep the overlay in a different folder than the bot.
+  const STATE_URL = "song_overlay_state.json";
+  const POLL_MS = 3000;
+
+  let player = null;
+  let playerReady = false;
+  let currentVideoId = null;
+
+  function onYouTubeIframeAPIReady() {
+    player = new YT.Player('player', {
+      height: '270', width: '480', videoId: '',
+      playerVars: { autoplay: 1, controls: 0, modestbranding: 1, rel: 0 },
+      events: { onReady: () => { playerReady = true; } },
+    });
+  }
+
+  function applyState(state) {
+    const np = state.now_playing;
+    const titleEl = document.getElementById('title');
+    const reqEl = document.getElementById('requester');
+
+    if (!np) {
+      currentVideoId = null;
+      titleEl.textContent = "Waiting for a song request...";
+      reqEl.textContent = "";
+      if (playerReady && player.stopVideo) player.stopVideo();
+      return;
+    }
+
+    titleEl.textContent = np.title;
+    reqEl.textContent = "requested by " + np.requested_by;
+
+    if (!playerReady) return;
+
+    const elapsed = Math.max(0, (Date.now() / 1000) - np.started_at);
+    if (np.video_id !== currentVideoId) {
+      currentVideoId = np.video_id;
+      player.loadVideoById({ videoId: np.video_id, startSeconds: elapsed });
+    }
+  }
+
+  async function poll() {
+    try {
+      const resp = await fetch(STATE_URL + "?t=" + Date.now(), { cache: "no-store" });
+      if (resp.ok) applyState(await resp.json());
+    } catch (e) {
+      // bot not running / file missing yet -- ignore and retry next poll
+    }
+    setTimeout(poll, POLL_MS);
+  }
+
+  poll();
+</script>
+</body>
+</html>
