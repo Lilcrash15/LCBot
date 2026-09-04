@@ -14,6 +14,8 @@ from typing import Callable, Optional
 from chatbot.core.config import ConfigStore
 from chatbot.core.database import Database
 from chatbot.core.irc_client import ChatMessage, TwitchIRCClient
+from chatbot.core.oauth import effective_client_id
+from chatbot.modules.alerts import AlertsModule
 from chatbot.modules.boss_battle import BossBattleModule
 from chatbot.modules.commands import BuiltinCommand, CommandContext, CommandEngine, default_variable_resolver
 from chatbot.modules.currency import CurrencyModule
@@ -66,7 +68,10 @@ class Bot:
         # making its own blocking Helix call on every 5s refresh.
         self.last_stream_info: Optional[StreamInfo] = None
 
-        self.irc = TwitchIRCClient(on_message=self._on_message, on_status=self.on_status, on_join=self._on_join)
+        self.irc = TwitchIRCClient(
+            on_message=self._on_message, on_status=self.on_status, on_join=self._on_join,
+            on_usernotice=self._on_usernotice,
+        )
         self.currency = CurrencyModule(db)
         self.moderation = ModerationModule(db)
         self.timers = TimersModule(db)
@@ -80,6 +85,7 @@ class Bot:
         self.boss_battle = BossBattleModule(db)
         self.event_system = EventSystemModule(db, sfx_module=self.sfx)
         self.discord = DiscordNotifier()
+        self.alerts = AlertsModule(db)
         self.engine = CommandEngine(db, resolve_variables=default_variable_resolver)
 
         self._register_modules()
@@ -90,8 +96,15 @@ class Bot:
     # -- lifecycle -------------------------------------------------------
     def refresh_apis(self) -> None:
         cfg = self.config.data
-        if cfg.client_id and cfg.helix_access_token:
-            self.twitch_api = TwitchAPI(cfg.client_id, cfg.helix_access_token)
+        # Falls back to LCBot's own shared Twitch app (see oauth.py's
+        # LCBOT_CLIENT_ID) when the user hasn't entered their own
+        # Client ID -- has to match whatever Client ID the "Log in
+        # with Twitch (streamer account)" button actually authorized
+        # with, or Twitch will reject every Helix call with the
+        # helix_access_token it issued.
+        client_id = effective_client_id(cfg.client_id)
+        if client_id and cfg.helix_access_token:
+            self.twitch_api = TwitchAPI(client_id, cfg.helix_access_token)
         else:
             self.twitch_api = None
         self.streaminfo.channel = (cfg.channel or self.streaminfo.channel).lower()
@@ -108,12 +121,18 @@ class Bot:
         cfg = self.config.data
         self.event_system.reset_session()
         self.discord.reset()
+        self.alerts.reset_session()
         self.last_stream_info = None
         self.irc.connect(cfg.bot_username, cfg.oauth_token, cfg.channel)
         self._start_scheduler()
 
     def _on_join(self, username: str) -> None:
         response = self.event_system.on_user_join(username, self)
+        if response:
+            self.send_chat(response)
+
+    def _on_usernotice(self, tags: dict) -> None:
+        response = self.alerts.handle_usernotice(tags)
         if response:
             self.send_chat(response)
 
@@ -204,7 +223,8 @@ class Bot:
                 self.currency.maybe_pay_active_users()
                 for message in self.timers.tick():
                     self.send_chat(message)
-                self.songrequests.tick()
+                for message in self.songrequests.tick():
+                    self.send_chat(message)
                 heist_result = self.heist.tick()
                 if heist_result:
                     self.send_chat(heist_result)
@@ -216,6 +236,8 @@ class Bot:
                     self.twitch_api, cfg.channel, cfg.discord_webhook_url,
                     cfg.discord_announce_enabled, cfg.discord_went_live_message,
                 )
+                for alert_message in self.alerts.tick(self.twitch_api, cfg.channel):
+                    self.send_chat(alert_message)
                 self._refresh_stream_info()
             except Exception:
                 logger.exception("scheduler tick failed")

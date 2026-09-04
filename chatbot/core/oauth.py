@@ -21,6 +21,21 @@ from typing import Optional
 logger = logging.getLogger("chatbot.oauth")
 
 DEFAULT_PORT = 17563
+
+# LCBot's own registered Twitch application -- lets anyone download and
+# run the app with a "Log in with Twitch" button and nothing else, no
+# separate trip to dev.twitch.tv to register their own app first. This
+# is the same model every commercial Twitch bot (Nightbot,
+# StreamElements, Moobot, ...) uses: ONE app, ONE Client ID, and every
+# streamer just authorizes it for their own account -- Client IDs
+# aren't secret (Twitch's own docs: "Client IDs are considered public
+# and can be embedded in a web page's source"), so it's safe to ship
+# baked into the app/repo, unlike a Client Secret (which this flow
+# never needs anyway -- see the module docstring). Registered by Ryan
+# at dev.twitch.tv/console/apps (redirect URI http://localhost:17563/,
+# category "Chat Bot") on 2026-09-01.
+LCBOT_CLIENT_ID = "1vf3133y15knihp96w59gly8g5ip2h"
+
 CHAT_SCOPES = ["chat:read", "chat:edit"]
 # user:write:chat lets the broadcaster's own token post chat messages via
 # the Helix Chat API -- powers the GUI's "chat as streamer" identity option.
@@ -73,6 +88,18 @@ class _CaptureHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args) -> None:  # silence default stderr logging
         logger.debug("oauth server: " + format, *args)
+
+
+def effective_client_id(configured: str) -> str:
+    """The Client ID actually used for both "Log in with Twitch" buttons
+    and every Helix API call -- whatever the user typed into Settings'
+    (optional, advanced) Client ID field, or LCBot's own shared app
+    (LCBOT_CLIENT_ID) if they left it blank. Nothing forces anyone
+    onto the shared app: pasting in a Client ID from their own
+    dev.twitch.tv registration still overrides it, same as before this
+    existed."""
+    configured = (configured or "").strip()
+    return configured or LCBOT_CLIENT_ID
 
 
 def authorize(client_id: str, scopes: list[str], port: int = DEFAULT_PORT, timeout: float = 180.0) -> Optional[dict]:

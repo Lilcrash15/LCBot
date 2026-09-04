@@ -200,6 +200,22 @@ class TwitchAPI:
         except urllib.error.URLError as exc:
             raise TwitchAPIError(f"Helix send chat message unreachable: {exc}") from exc
 
+    def get_recent_followers(self, broadcaster_login: str, first: int = 10) -> list[dict]:
+        """Returns the most recently followed users, newest first, as
+        [{'user_id', 'user_login', 'user_name', 'followed_at'}, ...].
+        Used to detect new followers by polling (Twitch has no live
+        "someone followed" chat/IRC event any more). Requires
+        moderator:read:followers on the broadcaster's own token (or a
+        moderator's). Deliberately not cached -- the alerts poll
+        already throttles how often this is called (see
+        modules/alerts.py), and caching here would delay noticing a
+        follow by however long the cache window is on top of that."""
+        broadcaster_id = self.get_user_id(broadcaster_login)
+        if not broadcaster_id:
+            return []
+        data = self._get("/channels/followers", {"broadcaster_id": broadcaster_id, "first": first})
+        return list(data.get("data", []))
+
     def get_follow_info(self, broadcaster_login: str, user_login: str) -> Optional[dict]:
         """Returns {'followed_at': iso8601 str} or None if not following.
         Requires moderator:read:followers scope on the token for the broadcaster's own channel."""

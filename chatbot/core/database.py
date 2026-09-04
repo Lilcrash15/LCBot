@@ -8,10 +8,15 @@ core/config.py instead.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
 from typing import Any, Iterable, Optional, Sequence
+
+from chatbot.core.paths import app_dir
+
+DEFAULT_DB_PATH = os.path.join(app_dir(), "chatbot.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -173,11 +178,38 @@ DEFAULT_SETTINGS = {
     "boss_max_damage": "75",
     "boss_victory_reward": "50",
     "boss_mvp_bonus": "150",
+    "alerts_enabled": "1",
+    "alerts_follow_enabled": "1",
+    "alerts_sub_enabled": "1",
+    "alerts_raid_enabled": "1",
+    "alerts_follow_message": "Thanks for the follow, {user}! \U0001F49C",
+    "alerts_sub_message": "{user} just subscribed! Thanks for the support! \U0001F389",
+    "alerts_resub_message": "{user} resubscribed for {months} months! \U0001F389",
+    "alerts_subgift_message": "{user} gifted a sub to {recipient}! \U0001F381",
+    "alerts_raid_message": "{user} is raiding with {viewers} viewers! Welcome raiders! \U0001F680",
+    "hide_support_popup": "0",
+    # Themes tab (chatbot/gui/theme.py) -- theme_name is one of
+    # theme.THEME_ORDER ("classic"/"dark"/"light"/"synthwave"/"forest"/
+    # "custom"); theme_custom_colors only matters when theme_name is
+    # "custom" and holds the 3 user-picked colors as
+    # "bg|fg|accent" (see theme.serialize_custom_colors/parse_custom_colors).
+    "theme_name": "classic",
+    "theme_custom_colors": "",
+    # Up to 3 saved custom color schemes ("Profile 1"/"Profile 2"/
+    # "Profile 3" in the Themes tab), same "bg|fg|accent" format as
+    # theme_custom_colors above -- blank means that slot hasn't been
+    # saved to yet. Separate from theme_custom_colors, which is always
+    # whatever's currently applied/in the picker; saving a profile
+    # copies that into one of these slots so it can be switched back
+    # to later without re-entering the colors by hand.
+    "theme_profile_1": "",
+    "theme_profile_2": "",
+    "theme_profile_3": "",
 }
 
 
 class Database:
-    def __init__(self, path: str = "chatbot.db"):
+    def __init__(self, path: str = DEFAULT_DB_PATH):
         self.path = path
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(path, check_same_thread=False)

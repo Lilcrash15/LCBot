@@ -13,8 +13,9 @@ import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict
 
+from chatbot.core.paths import app_dir
 
-DEFAULT_CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
+DEFAULT_CONFIG_PATH = os.path.join(app_dir(), "config.json")
 
 
 @dataclass

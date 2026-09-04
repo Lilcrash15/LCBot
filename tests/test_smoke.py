@@ -9,20 +9,24 @@ in the plumbing, not to validate live behavior.
 """
 import os
 import random
+import shutil
 import sys
 import tempfile
 import time
 import unittest
 import urllib.request
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from chatbot.core import overlay_server
+from chatbot.core import backup, oauth, overlay_server, paths, update_check
 from chatbot.core.bot import Bot
 from chatbot.core.config import ConfigStore
 from chatbot.core.database import Database
 from chatbot.core.friendly_errors import friendly_error_text
 from chatbot.core.irc_client import ChatMessage, TwitchIRCClient, _parse_tags
+from chatbot.gui import theme
+from chatbot.modules.alerts import AlertsModule
 from chatbot.modules.boss_battle import BossBattleModule, BossState
 from chatbot.modules.commands import CommandContext, CommandEngine, default_variable_resolver
 from chatbot.modules.currency import CurrencyModule
@@ -32,6 +36,7 @@ from chatbot.modules.game_queue import GameQueueModule
 from chatbot.modules.giveaway import GiveawayModule, GiveawayState
 from chatbot.modules.heist import HeistModule, HeistState
 from chatbot.modules.moderation import ModerationModule
+from chatbot.modules.songrequests import SongRequestsModule
 from chatbot.modules.streaminfo import StreamInfoModule
 from chatbot.modules.twitch_api import StreamInfo, TwitchAPIError
 from chatbot.modules.youtube_api import extract_video_id, parse_iso8601_duration
@@ -77,6 +82,14 @@ class DatabaseTests(unittest.TestCase):
     def test_default_settings_present(self):
         self.assertEqual(self.db.get_setting("currency_name"), "points")
         self.assertEqual(self.db.get_setting_int("currency_earn_amount"), 10)
+
+    def test_theme_profile_slots_default_empty(self):
+        # The 3 Saved Custom Profiles slots (Themes tab) start blank --
+        # theme.parse_custom_colors("") returns None, which is what
+        # MainWindow._refresh_theme_profile_ui treats as "(empty)" /
+        # Load disabled, so a fresh install shows no profiles as saved.
+        for slot in (1, 2, 3):
+            self.assertEqual(self.db.get_setting(f"theme_profile_{slot}"), "")
 
     def test_points_never_go_negative(self):
         self.db.add_points("alice", 50)
@@ -975,6 +988,443 @@ class OverlayServerTests(unittest.TestCase):
     def test_second_start_on_same_port_returns_none_instead_of_raising(self):
         second = overlay_server.start(self.tmpdir, port=self.port)
         self.assertIsNone(second)
+
+
+class FakeFollowersAPI:
+    """Stands in for TwitchAPI.get_recent_followers in AlertsModule
+    tests -- returns whatever list `self.followers` currently holds
+    (most-recent-first, like the real Helix endpoint), and records how
+    many times it was actually called so throttling can be asserted."""
+
+    def __init__(self, followers=None):
+        self.followers = followers or []
+        self.calls = 0
+
+    def get_recent_followers(self, broadcaster_login, first=10):
+        self.calls += 1
+        return self.followers[:first]
+
+
+class AlertsUsernoticeTests(unittest.TestCase):
+    """Sub/resub/subgift/raid alerts come from Twitch IRC's USERNOTICE
+    tags in real time -- see irc_client.py's on_usernotice callback."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db = Database(os.path.join(self.tmpdir, "chatbot.db"))
+        self.alerts = AlertsModule(self.db)
+
+    def test_sub_uses_default_template(self):
+        msg = self.alerts.handle_usernotice({"msg-id": "sub", "display-name": "Foo"})
+        self.assertIn("Foo", msg)
+        self.assertIn("subscribed", msg)
+
+    def test_resub_includes_cumulative_months(self):
+        msg = self.alerts.handle_usernotice(
+            {"msg-id": "resub", "display-name": "Foo", "msg-param-cumulative-months": "6"}
+        )
+        self.assertIn("Foo", msg)
+        self.assertIn("6", msg)
+
+    def test_subgift_includes_recipient(self):
+        msg = self.alerts.handle_usernotice({
+            "msg-id": "subgift", "display-name": "Gifter",
+            "msg-param-recipient-display-name": "LuckyViewer",
+        })
+        self.assertIn("Gifter", msg)
+        self.assertIn("LuckyViewer", msg)
+
+    def test_raid_includes_viewer_count(self):
+        msg = self.alerts.handle_usernotice(
+            {"msg-id": "raid", "display-name": "BigStreamer", "msg-param-viewerCount": "42"}
+        )
+        self.assertIn("BigStreamer", msg)
+        self.assertIn("42", msg)
+
+    def test_unrecognized_msg_id_returns_none(self):
+        self.assertIsNone(self.alerts.handle_usernotice({"msg-id": "ritual", "display-name": "Foo"}))
+
+    def test_disabled_globally_suppresses_everything(self):
+        self.db.set_setting("alerts_enabled", "0")
+        self.assertIsNone(self.alerts.handle_usernotice({"msg-id": "sub", "display-name": "Foo"}))
+
+    def test_sub_type_disabled_suppresses_sub_but_not_raid(self):
+        self.db.set_setting("alerts_sub_enabled", "0")
+        self.assertIsNone(self.alerts.handle_usernotice({"msg-id": "sub", "display-name": "Foo"}))
+        msg = self.alerts.handle_usernotice(
+            {"msg-id": "raid", "display-name": "Foo", "msg-param-viewerCount": "5"}
+        )
+        self.assertIsNotNone(msg)
+
+    def test_custom_template_is_used(self):
+        self.db.set_setting("alerts_sub_message", "WOW {user} subbed!!")
+        msg = self.alerts.handle_usernotice({"msg-id": "sub", "display-name": "Foo"})
+        self.assertEqual(msg, "WOW Foo subbed!!")
+
+
+class AlertsFollowerPollingTests(unittest.TestCase):
+    """New followers have no live IRC event any more -- detected by
+    polling and diffing against what's already been seen, same pattern
+    DiscordNotifierTests uses for went-live detection."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db = Database(os.path.join(self.tmpdir, "chatbot.db"))
+        self.alerts = AlertsModule(self.db)
+
+    def test_first_check_establishes_baseline_without_announcing(self):
+        api = FakeFollowersAPI([{"user_id": "1", "user_name": "Existing"}])
+        messages = self.alerts.tick(api, "chan", now=1000.0)
+        self.assertEqual(messages, [])
+
+    def test_new_follower_after_baseline_is_announced(self):
+        api = FakeFollowersAPI([{"user_id": "1", "user_name": "Existing"}])
+        self.alerts.tick(api, "chan", now=1000.0)  # baseline
+        api.followers = [
+            {"user_id": "2", "user_name": "NewFollower"},
+            {"user_id": "1", "user_name": "Existing"},
+        ]
+        messages = self.alerts.tick(api, "chan", now=1070.0)  # past the 60s throttle
+        self.assertEqual(len(messages), 1)
+        self.assertIn("NewFollower", messages[0])
+
+    def test_throttled_before_interval_elapses(self):
+        api = FakeFollowersAPI([{"user_id": "1", "user_name": "Existing"}])
+        self.alerts.tick(api, "chan", now=1000.0)
+        self.alerts.tick(api, "chan", now=1010.0)  # well under 60s later
+        self.assertEqual(api.calls, 1)
+
+    def test_reconnect_resets_baseline_so_no_false_flood(self):
+        api = FakeFollowersAPI([{"user_id": "1", "user_name": "Existing"}])
+        self.alerts.tick(api, "chan", now=1000.0)
+        self.alerts.reset_session()
+        messages = self.alerts.tick(api, "chan", now=2000.0)
+        self.assertEqual(messages, [])
+
+    def test_disabled_follow_alert_returns_nothing(self):
+        self.db.set_setting("alerts_follow_enabled", "0")
+        api = FakeFollowersAPI([{"user_id": "1", "user_name": "Existing"}])
+        messages = self.alerts.tick(api, "chan", now=1000.0)
+        self.assertEqual(messages, [])
+        self.assertEqual(api.calls, 0)
+
+
+class IRCUsernoticeDispatchTests(unittest.TestCase):
+    """Confirms irc_client.py actually parses USERNOTICE lines and
+    invokes on_usernotice with the tag dict, mirroring
+    IRCClientBehaviorTests' style for the other callbacks."""
+
+    def setUp(self):
+        self.usernotices = []
+        self.client = TwitchIRCClient(
+            on_message=lambda m: None,
+            on_usernotice=lambda tags: self.usernotices.append(tags),
+        )
+        self.client._our_nick = "mybot"
+        self.client._channel = "testchan"
+
+    def test_usernotice_tags_are_parsed_and_dispatched(self):
+        self.client._handle_line(
+            "@msg-id=raid;display-name=Foo;msg-param-viewerCount=10 "
+            ":tmi.twitch.tv USERNOTICE #testchan"
+        )
+        self.assertEqual(len(self.usernotices), 1)
+        self.assertEqual(self.usernotices[0]["msg-id"], "raid")
+        self.assertEqual(self.usernotices[0]["display-name"], "Foo")
+
+
+class BackupRestoreTests(unittest.TestCase):
+    """create_backup/restore_backup round-trip through a real sqlite
+    file (using sqlite3's own backup API, not a raw file copy -- see
+    backup.py's docstring for why), plus the guardrails: a backup file
+    is rejected outright unless it carries LCBot's manifest, and
+    restoring saves the previous database aside rather than silently
+    discarding it."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "chatbot.db")
+        self.db = Database(self.db_path)
+        self.db.upsert_command("hello", response="hi there!")
+        self.db.add_quote("test quote", "someone", "Just Chatting", "mod")
+        self.db.set_points("vieweruser", 500)
+
+    def test_backup_then_restore_round_trips_data(self):
+        backup_path = os.path.join(self.tmpdir, "mybackup.lcbotbak")
+        backup.create_backup(self.db_path, backup_path, "0.1.1")
+        self.assertTrue(os.path.exists(backup_path))
+
+        # Simulate data changing after the backup was taken.
+        self.db.delete_command("hello")
+        self.db.set_points("vieweruser", 0)
+        self.db.close()
+
+        manifest = backup.restore_backup(backup_path, self.db_path)
+        self.assertEqual(manifest["magic"], backup.BACKUP_MAGIC)
+
+        restored = Database(self.db_path)
+        self.assertIsNotNone(restored.get_command("hello"))
+        self.assertEqual(restored.get_user("vieweruser")["points"], 500)
+        restored.close()
+
+    def test_restore_saves_previous_database_as_safety_backup(self):
+        backup_path = os.path.join(self.tmpdir, "mybackup.lcbotbak")
+        backup.create_backup(self.db_path, backup_path, "0.1.1")
+        self.db.close()
+
+        backup.restore_backup(backup_path, self.db_path)
+        safety_copies = [
+            f for f in os.listdir(self.tmpdir) if f.startswith("chatbot.db.pre-restore-")
+        ]
+        self.assertEqual(len(safety_copies), 1)
+
+    def test_garbage_file_is_rejected_not_silently_accepted(self):
+        fake_path = os.path.join(self.tmpdir, "not-a-backup.lcbotbak")
+        with open(fake_path, "w") as fh:
+            fh.write("this is not a zip file at all")
+        with self.assertRaises(backup.InvalidBackupError):
+            backup.read_manifest(fake_path)
+
+    def test_valid_zip_without_lcbot_manifest_is_rejected(self):
+        import zipfile
+        fake_path = os.path.join(self.tmpdir, "wrong-format.lcbotbak")
+        with zipfile.ZipFile(fake_path, "w") as zf:
+            zf.writestr("readme.txt", "just some other zip file")
+        with self.assertRaises(backup.InvalidBackupError):
+            backup.read_manifest(fake_path)
+
+    def test_export_portable_json_is_plain_and_readable(self):
+        import json
+        export_path = os.path.join(self.tmpdir, "export.json")
+        backup.export_portable_json(self.db, export_path)
+        with open(export_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertIn("commands", data)
+        self.assertIn("quotes", data)
+        self.assertTrue(any(c["name"] == "hello" for c in data["commands"]))
+
+
+class UpdateCheckTests(unittest.TestCase):
+    """update_check.py is a courtesy, best-effort check -- every failure
+    mode (network down, bad JSON, no releases yet) should come back as
+    None rather than raising, so a broken check never blocks startup."""
+
+    def _mock_response(self, payload_bytes):
+        cm = mock.MagicMock()
+        cm.__enter__.return_value.read.return_value = payload_bytes
+        cm.__exit__.return_value = False
+        return cm
+
+    def test_newer_release_available(self):
+        body = b'{"tag_name": "v9.9.9", "html_url": "https://example.com/releases/tag/v9.9.9"}'
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_response(body)):
+            result = update_check.check_for_update("0.1.1")
+        self.assertEqual(result["version"], "v9.9.9")
+        self.assertEqual(result["url"], "https://example.com/releases/tag/v9.9.9")
+
+    def test_same_or_older_release_returns_none(self):
+        body = b'{"tag_name": "v0.1.0", "html_url": "https://example.com"}'
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_response(body)):
+            result = update_check.check_for_update("0.1.1")
+        self.assertIsNone(result)
+
+    def test_network_failure_returns_none_not_raises(self):
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("no network")):
+            result = update_check.check_for_update("0.1.1")
+        self.assertIsNone(result)
+
+    def test_malformed_json_returns_none_not_raises(self):
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_response(b"not json")):
+            result = update_check.check_for_update("0.1.1")
+        self.assertIsNone(result)
+
+    def test_four_part_version_tags_compare_correctly(self):
+        body = b'{"tag_name": "v0.1.1.2", "html_url": "https://example.com"}'
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_response(body)):
+            result = update_check.check_for_update("0.1.1")
+        self.assertEqual(result["version"], "v0.1.1.2")
+
+
+class OAuthClientIdFallbackTests(unittest.TestCase):
+    """The "Log in with Twitch" buttons and every Helix call need the
+    same Client ID -- oauth.effective_client_id() is the one place
+    that decides which one that is (the user's own, if they entered
+    one in Settings' optional/advanced Client ID field, else LCBot's
+    shared built-in app -- see oauth.LCBOT_CLIENT_ID). Covers both the
+    pure function and Bot.refresh_apis actually using it when building
+    the TwitchAPI client."""
+
+    def test_uses_configured_client_id_when_present(self):
+        self.assertEqual(oauth.effective_client_id("my-own-id"), "my-own-id")
+
+    def test_strips_whitespace_from_configured_client_id(self):
+        self.assertEqual(oauth.effective_client_id("  my-own-id  "), "my-own-id")
+
+    def test_falls_back_to_shared_client_id_when_blank(self):
+        with mock.patch.object(oauth, "LCBOT_CLIENT_ID", "lcbot-shared-id"):
+            self.assertEqual(oauth.effective_client_id(""), "lcbot-shared-id")
+            self.assertEqual(oauth.effective_client_id(None), "lcbot-shared-id")
+            self.assertEqual(oauth.effective_client_id("   "), "lcbot-shared-id")
+
+    def test_configured_client_id_overrides_shared_one(self):
+        with mock.patch.object(oauth, "LCBOT_CLIENT_ID", "lcbot-shared-id"):
+            self.assertEqual(oauth.effective_client_id("my-own-id"), "my-own-id")
+
+    def test_returns_blank_when_neither_is_set(self):
+        # Today's real state (LCBOT_CLIENT_ID is still "" until Ryan
+        # registers the shared app) -- callers need to keep handling
+        # this case (see MainWindow._show_missing_client_id_error)
+        # until it's wired in.
+        with mock.patch.object(oauth, "LCBOT_CLIENT_ID", ""):
+            self.assertEqual(oauth.effective_client_id(""), "")
+
+    def _make_bot(self):
+        tmpdir = tempfile.mkdtemp()
+        config = ConfigStore(os.path.join(tmpdir, "config.json"))
+        config.data.helix_access_token = "some-token"
+        db = Database(os.path.join(tmpdir, "chatbot.db"))
+        return Bot(config, db)
+
+    def test_refresh_apis_uses_shared_client_id_when_user_left_it_blank(self):
+        bot = self._make_bot()
+        bot.config.data.client_id = ""
+        with mock.patch.object(oauth, "LCBOT_CLIENT_ID", "lcbot-shared-id"):
+            bot.refresh_apis()
+        self.assertIsNotNone(bot.twitch_api)
+        self.assertEqual(bot.twitch_api.client_id, "lcbot-shared-id")
+
+    def test_refresh_apis_prefers_users_own_client_id(self):
+        bot = self._make_bot()
+        bot.config.data.client_id = "my-own-id"
+        with mock.patch.object(oauth, "LCBOT_CLIENT_ID", "lcbot-shared-id"):
+            bot.refresh_apis()
+        self.assertEqual(bot.twitch_api.client_id, "my-own-id")
+
+    def test_refresh_apis_leaves_twitch_api_none_without_any_client_id_or_token(self):
+        bot = self._make_bot()
+        bot.config.data.client_id = ""
+        bot.config.data.helix_access_token = ""
+        with mock.patch.object(oauth, "LCBOT_CLIENT_ID", ""):
+            bot.refresh_apis()
+        self.assertIsNone(bot.twitch_api)
+
+
+class ThemeTests(unittest.TestCase):
+    """Only the pure color-math side of theme.py (the Themes tab's
+    engine) -- no tk.Tk()/ttk.Style instantiation here, matching this
+    file's no-tkinter policy. apply_theme()/apply_dark_theme() are
+    exercised for real by the Xvfb+ImageMagick headless GUI check
+    before each ship, not here."""
+
+    def test_all_presets_have_the_same_keys(self):
+        expected_keys = set(theme.PRESETS["classic"].keys())
+        for name, colors in theme.PRESETS.items():
+            self.assertEqual(set(colors.keys()), expected_keys, name)
+            for key, value in colors.items():
+                self.assertTrue(theme.is_valid_hex_color(value), f"{name}.{key} = {value!r}")
+
+    def test_theme_order_and_labels_agree(self):
+        self.assertEqual(set(theme.THEME_ORDER), set(theme.THEME_LABELS.keys()))
+        # Every preset in PRESETS is reachable from the dropdown; "custom"
+        # is the one label with no PRESETS entry (built on the fly).
+        self.assertEqual(set(theme.THEME_ORDER) - {"custom"}, set(theme.PRESETS.keys()))
+
+    def test_is_valid_hex_color(self):
+        self.assertTrue(theme.is_valid_hex_color("#1a1a1a"))
+        self.assertTrue(theme.is_valid_hex_color("#ABCDEF"))
+        self.assertFalse(theme.is_valid_hex_color("1a1a1a"))       # missing '#'
+        self.assertFalse(theme.is_valid_hex_color("#1a1a1"))       # too short
+        self.assertFalse(theme.is_valid_hex_color("#gggggg"))      # not hex
+        self.assertFalse(theme.is_valid_hex_color(""))
+        self.assertFalse(theme.is_valid_hex_color(None))
+
+    def test_build_custom_colors_produces_all_ten_keys(self):
+        colors = theme.build_custom_colors("#101010", "#f0f0f0", "#00aaff")
+        self.assertEqual(set(colors.keys()), set(theme.PRESETS["classic"].keys()))
+        self.assertEqual(colors["BG"], "#101010")
+        self.assertEqual(colors["FG"], "#f0f0f0")
+        self.assertEqual(colors["ACCENT"], "#00aaff")
+        for value in colors.values():
+            self.assertTrue(theme.is_valid_hex_color(value))
+
+    def test_build_custom_colors_falls_back_on_bad_input(self):
+        # A blank/garbage color for any of the 3 inputs should fall back
+        # to Classic's value for that slot rather than raising or
+        # producing garbage output -- a bad Entry value can't be allowed
+        # to crash theme application.
+        colors = theme.build_custom_colors("not-a-color", "#ffffff", "#ff0000")
+        self.assertEqual(colors["BG"], theme.PRESETS["classic"]["BG"])
+        self.assertEqual(colors["FG"], "#ffffff")
+        self.assertEqual(colors["ACCENT"], "#ff0000")
+
+    def test_build_custom_colors_picks_readable_select_fg(self):
+        # A bright accent should get dark selection text, a dark accent
+        # should get light selection text -- either way, readable.
+        bright = theme.build_custom_colors("#101010", "#f0f0f0", "#ffee00")
+        dark = theme.build_custom_colors("#101010", "#f0f0f0", "#1a0030")
+        self.assertEqual(bright["SELECT_FG"], "#141414")
+        self.assertEqual(dark["SELECT_FG"], "#f5f5f5")
+
+    def test_serialize_and_parse_custom_colors_round_trip(self):
+        raw = theme.serialize_custom_colors("#101010", "#f0f0f0", "#00aaff")
+        parsed = theme.parse_custom_colors(raw)
+        self.assertEqual(parsed, ("#101010", "#f0f0f0", "#00aaff"))
+
+    def test_parse_custom_colors_rejects_bad_input(self):
+        self.assertIsNone(theme.parse_custom_colors(None))
+        self.assertIsNone(theme.parse_custom_colors(""))
+        self.assertIsNone(theme.parse_custom_colors("#101010|#f0f0f0"))          # only 2 parts
+        self.assertIsNone(theme.parse_custom_colors("not-a-color|#f0f0f0|#00aaff"))
+
+    def test_resolve_colors_known_preset(self):
+        self.assertEqual(theme.resolve_colors("dark"), theme.PRESETS["dark"])
+
+    def test_resolve_colors_unknown_name_falls_back_to_classic(self):
+        self.assertEqual(theme.resolve_colors("not-a-real-theme"), theme.PRESETS["classic"])
+
+    def test_resolve_colors_custom_with_valid_saved_colors(self):
+        raw = theme.serialize_custom_colors("#101010", "#f0f0f0", "#00aaff")
+        colors = theme.resolve_colors("custom", raw)
+        self.assertEqual(colors, theme.build_custom_colors("#101010", "#f0f0f0", "#00aaff"))
+
+    def test_resolve_colors_custom_with_missing_or_bad_saved_colors_falls_back(self):
+        self.assertEqual(theme.resolve_colors("custom", ""), theme.PRESETS["classic"])
+        self.assertEqual(theme.resolve_colors("custom", None), theme.PRESETS["classic"])
+        self.assertEqual(theme.resolve_colors("custom", "garbage"), theme.PRESETS["classic"])
+
+    def test_current_is_dark_follows_live_theme(self):
+        # current_is_dark() drives the Windows titlebar mode for the
+        # main window and every popup (_apply_windows_titlebar_mode) --
+        # it must track whichever theme is actually live right now, via
+        # the same module globals as everything else in this file, not
+        # some cached value from whenever apply_theme() last ran.
+        original_bg = theme.BG
+        try:
+            theme.BG = theme.PRESETS["classic"]["BG"]
+            self.assertTrue(theme.current_is_dark())
+            theme.BG = theme.PRESETS["light"]["BG"]
+            self.assertFalse(theme.current_is_dark())
+        finally:
+            # Restore the live global so later tests in this process
+            # (or a re-run) don't inherit a stale "light" BG.
+            theme.BG = original_bg
+
+
+class PathsTests(unittest.TestCase):
+    """app_dir() -- built in response to Ryan's taskbar-icon report: a
+    fresh rebuild still couldn't find assets/icon.ico, and resolving
+    paths against the exe's own directory instead of os.getcwd() is
+    the standard fix for a shortcut/launcher handing the process an
+    unexpected working directory."""
+
+    def test_app_dir_matches_cwd_when_not_frozen(self):
+        self.assertFalse(getattr(sys, "frozen", False))
+        self.assertEqual(paths.app_dir(), os.getcwd())
+
+    def test_app_dir_uses_executable_directory_when_frozen(self):
+        with mock.patch.object(sys, "frozen", True, create=True), \
+                mock.patch.object(sys, "executable", "/fake/dist/TwitchChatBotV2.exe"):
+            self.assertEqual(paths.app_dir(), "/fake/dist")
 
 
 if __name__ == "__main__":

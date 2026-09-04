@@ -1,6 +1,16 @@
-# No third-party dependencies -- everything runs on the Python 3.10+
-# standard library (sqlite3, tkinter, ssl/socket, urllib, http.server).
+# Zero third-party dependencies -- everything runs on the Python
+# 3.10+ standard library (sqlite3, tkinter, ssl/socket, urllib,
+# http.server). Nothing to install here; this file exists so
+# build_exe.bat has something to point pip at if that ever changes.
 #
 # On Windows, tkinter ships with the standard python.org installer.
 # On Linux, install your distro's tk package if it's not already there
 # (e.g. `sudo apt install python3-tk` on Debian/Ubuntu).
+
+# Note (2026-09-04): yt-dlp was briefly a dependency here for an
+# opt-in local song-audio-playback feature (see CHANGELOG.md's
+# "Removed: local song playback" entry). Real-world testing on
+# Ryan's PC never got Windows' MCI API to actually play a downloaded
+# file, so the feature -- and this dependency -- was removed rather
+# than shipped half-working. The song request queue is back to
+# always using the original Browser Source overlay.

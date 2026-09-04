@@ -89,11 +89,18 @@ class TwitchIRCClient:
         on_status: Optional[Callable[[str], None]] = None,
         on_raw: Optional[Callable[[str], None]] = None,
         on_join: Optional[Callable[[str], None]] = None,
+        on_usernotice: Optional[Callable[[dict], None]] = None,
     ):
         self.on_message = on_message
         self.on_status = on_status or (lambda msg: None)
         self.on_raw = on_raw or (lambda line: None)
         self.on_join = on_join or (lambda username: None)
+        # Twitch sends sub/resub/gift-sub/raid/ritual events as
+        # USERNOTICE, tagged with msg-id and a bunch of msg-param-*
+        # fields -- see AlertsModule.handle_usernotice for what it does
+        # with these tags. Requires the twitch.tv/commands capability,
+        # already requested below alongside tags/membership.
+        self.on_usernotice = on_usernotice or (lambda tags: None)
 
         self._sock: Optional[ssl.SSLSocket] = None
         self._reader_thread: Optional[threading.Thread] = None
@@ -249,6 +256,13 @@ class TwitchIRCClient:
                     self.on_join(login.lower())
                 except Exception:
                     logger.exception("on_join handler raised")
+            return
+
+        if command == "USERNOTICE":
+            try:
+                self.on_usernotice(tags)
+            except Exception:
+                logger.exception("on_usernotice handler raised")
             return
 
         if command != "PRIVMSG":

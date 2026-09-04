@@ -1,11 +1,34 @@
 """Song request queue -- !sr / !skip / !wrongsong / !queue / !song.
 
-Playback itself happens in an OBS/Streamlabs OBS browser source
+Playback happens in an OBS/Streamlabs OBS browser source
 (overlay/song_overlay.html), not in this process. This module just
 keeps the queue and writes out the current "now playing" state to a
 JSON file that the overlay polls; advancing the queue is time-based
-(tick() is called every few seconds by the bot's scheduler) so the
-overlay never needs to talk back to Python.
+(tick() is called every few seconds by the bot's scheduler) since the
+overlay never talks back to Python. Zero extra dependencies, stays
+inside YouTube's Terms of Service (their own IFrame Player does the
+actual playback).
+
+Note for future reference (2026-09-04): a local-playback mode used to
+exist here -- downloading each song's audio via yt-dlp and playing it
+back in-process via the Windows MCI API, so OBS could capture the
+bot's own application audio instead of needing a Browser Source. It
+shipped, but real-world testing on Ryan's PC never got MCI to actually
+play a downloaded file (every attempt failed with a generic MCI
+"internal error", both with an explicit device type and with
+auto-detect, despite the download itself completing correctly and the
+file being a normal size) -- diagnosing MCI failures further wasn't
+worth it against a Browser Source approach that already works
+reliably and stays inside YouTube's ToS, so Ryan asked to remove it
+and go back to Browser-Source-only. Removed rather than left disabled
+behind a setting: chatbot/core/audio_player.py and
+chatbot/core/youtube_audio.py are both gone, and the yt-dlp dependency
+is gone with them, so the project is back to zero third-party
+dependencies. If local playback is ever revisited, the removed files
+are in git history (search this project's CHANGELOG for "local song
+playback" to find the commit range) -- but the honest lesson from this
+round is that MCI's own error reporting is too generic to have
+diagnosed the real cause from log output alone.
 """
 from __future__ import annotations
 
@@ -15,6 +38,7 @@ import os
 import time
 from typing import Optional
 
+from chatbot.core.paths import app_dir
 from chatbot.modules.commands import BuiltinCommand, CommandContext, CommandEngine
 from chatbot.modules.youtube_api import YouTubeAPI, YouTubeAPIError
 
@@ -22,10 +46,19 @@ logger = logging.getLogger("chatbot.songrequests")
 
 
 class SongRequestsModule:
-    def __init__(self, db, api: Optional[YouTubeAPI], state_path: str = os.path.join("overlay", "song_overlay_state.json")):
+    def __init__(
+        self,
+        db,
+        api: Optional[YouTubeAPI],
+        state_path: Optional[str] = None,
+    ):
         self.db = db
         self.api = api
-        self.state_path = state_path
+        # Resolved here (not as a literal default-argument value) so
+        # it's relative to the exe's own folder (app_dir(), see
+        # paths.py) rather than whatever the OS set as the working
+        # directory -- matters for the compiled exe, not source runs.
+        self.state_path = state_path or os.path.join(app_dir(), "overlay", "song_overlay_state.json")
         self.now_playing: Optional[dict] = None
         self._write_state()
 
@@ -86,12 +119,25 @@ class SongRequestsModule:
         return f"@{ctx.user} queued \"{video.title}\" (position {position})."
 
     def _cmd_skip(self, ctx: CommandContext) -> str:
-        if self.now_playing is None:
+        title = self.skip_current()
+        if title is None:
             return f"@{ctx.user} nothing is playing."
+        return f"Skipped \"{title}\"."
+
+    def skip_current(self) -> Optional[str]:
+        """Stops whatever's currently playing and clears it, returning
+        its title (or None if nothing was playing) -- shared by !skip
+        and the Song Req tab's "Skip Current" button. Previously this
+        button called tick() directly, which never actually cleared
+        now_playing, so clicking it silently did nothing until the
+        song finished naturally on its own -- both now go through this
+        instead."""
+        if self.now_playing is None:
+            return None
         title = self.now_playing.get("title", "current song")
         self.now_playing = None
         self.tick()
-        return f"Skipped \"{title}\"."
+        return title
 
     def _cmd_wrongsong(self, ctx: CommandContext) -> str:
         row = self.db.remove_last_request_by(ctx.username)
@@ -111,10 +157,20 @@ class SongRequestsModule:
             return "Nothing is playing right now."
         return f"Now playing: \"{self.now_playing['title']}\" requested by {self.now_playing['requested_by']}."
 
-    # -- queue advancement / overlay state -------------------------------
-    def tick(self) -> None:
+    # -- queue advancement -------------------------------------------
+    def tick(self) -> list:
+        """Called every few seconds by the bot's scheduler. Always
+        returns an empty list -- overlay mode never announces anything
+        in chat, the browser overlay is the "what's playing" surface.
+        Kept as a list return (rather than reverting to None) since
+        bot.py's scheduler loop already iterates it and other modules
+        (heist/boss_battle/timers) share that same convention."""
         if not self.db.get_setting_bool("songrequests_enabled", True):
-            return
+            return []
+        self._tick_overlay()
+        return []
+
+    def _tick_overlay(self) -> None:
         now = time.time()
         if self.now_playing is not None:
             elapsed = now - self.now_playing["started_at"]

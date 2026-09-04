@@ -4,34 +4,39 @@ they only ever push onto a thread-safe queue here; a `self.after()`
 poll loop drains that queue on the Tk main thread, which is the only
 thread allowed to touch widgets.
 
-Tab layout and dark/orange styling are modeled on the original AnkhBot
-R2's UI (Console, Dashboard, Commands, Timers, Quotes, Give Away, SFX,
-Currency System, Mini Games, Event System, Song Requests, Queue,
-Settings) with a couple of additions (Moderation, Users) that AnkhBot
-didn't have a dedicated tab for.
+Tab layout and the default dark/orange styling are modeled on the
+original AnkhBot R2's UI (Console, Dashboard, Commands, Timers, Quotes,
+Give Away, SFX, Currency System, Mini Games, Event System, Song
+Requests, Queue, Settings) with a couple of additions (Moderation,
+Users, Themes) that AnkhBot didn't have a dedicated tab for -- Themes
+(see chatbot/gui/theme.py) lets that default look be swapped for a
+handful of other built-in presets or a fully custom color scheme.
 """
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import queue
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+import webbrowser
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from typing import Optional
 
 from chatbot import __version__
-from chatbot.core import oauth, overlay_server
+from chatbot.core import backup, oauth, overlay_server, update_check
 from chatbot.core.bot import Bot
 from chatbot.core.config import ConfigStore
 from chatbot.core.database import Database
 from chatbot.core.friendly_errors import friendly_error_text
 from chatbot.core.irc_client import ChatMessage
+from chatbot.core.paths import app_dir
 from chatbot.gui import theme
 from chatbot.gui.emote_cache import EmoteBadgeCache
-from chatbot.gui.theme import apply_dark_theme, style_listbox, style_text_widget
+from chatbot.gui.theme import style_listbox, style_text_widget
 
 # The Console tab's own font choice -- bigger and easier to read than the
 # rest of the app's controls, closer to what a modern chat client (Twitch,
@@ -41,8 +46,14 @@ from chatbot.gui.theme import apply_dark_theme, style_listbox, style_text_widget
 CHAT_FONT_FAMILY = "Segoe UI"
 CHAT_FONT_SIZE = 12
 
+logger = logging.getLogger("chatbot.main_window")
+
 POLL_MS = 150
 REFRESH_MS = 5000
+
+# Ryan's donation/support link -- shown in the startup "buy me a
+# coffee" popup and the Help menu.
+SUPPORT_URL = "https://streamlabs.com/lilcrash15/tip"
 
 
 class MainWindow(tk.Tk):
@@ -51,12 +62,20 @@ class MainWindow(tk.Tk):
         self.title(f"Twitch Chat Bot -- v{__version__}")
         self.geometry("1180x720")
         self.minsize(1180, 600)
-        self.style = apply_dark_theme(self)
-        self._apply_windows_dark_titlebar()
-        self._apply_app_icon()
 
         self.config_store = config
         self.db = db
+        # Themes tab (see _build_themes_tab): whichever theme was saved
+        # last time gets applied before any widget is built, same as
+        # the Classic theme always used to be applied unconditionally.
+        self._current_theme_name = db.get_setting("theme_name", "classic")
+        initial_colors = theme.resolve_colors(
+            self._current_theme_name, db.get_setting("theme_custom_colors", "")
+        )
+        self.style = theme.apply_theme(self, initial_colors)
+        self._apply_windows_titlebar_mode(self)
+        self._apply_app_icon()
+
         self._event_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
         self.bot = Bot(
@@ -69,11 +88,11 @@ class MainWindow(tk.Tk):
         # Serves the overlay folder at http://localhost:17564/ so OBS's
         # Browser Source can fetch() the live state file (see
         # overlay_server.py for why "Local file" mode can't do this).
-        self._overlay_server = overlay_server.start(os.path.join(os.getcwd(), "overlay"))
+        self._overlay_server = overlay_server.start(os.path.join(app_dir(), "overlay"))
 
         # Twitch emote / chat badge images for the Console tab.
         self.emote_cache = EmoteBadgeCache(
-            cache_dir=os.path.join(os.getcwd(), "emote_cache"),
+            cache_dir=os.path.join(app_dir(), "emote_cache"),
             get_twitch_api=lambda: self.bot.twitch_api,
             get_broadcaster_login=lambda: self.config_store.data.channel,
         )
@@ -87,26 +106,37 @@ class MainWindow(tk.Tk):
         if config.data.autoconnect and config.data.is_ready_to_connect():
             self.after(500, self._connect)
 
+        self._check_for_update()
+        self._maybe_show_support_popup()
+
     # -- window chrome --------------------------------------------------
-    def _apply_windows_dark_titlebar(self) -> None:
-        """Switches the native title bar (the strip with the window
-        title and minimize/maximize/close buttons -- Tkinter has no way
-        to draw or recolor that itself, it's OS chrome) into Windows'
-        own dark mode, via the same undocumented DWM attribute apps
-        like Discord and Spotify use for their dark titlebars. This
-        can't be tested from the Linux dev sandbox, only on Ryan's
-        actual Windows machine -- it's a no-op (silently, safely)
-        anywhere else, including older Windows builds without this
-        attribute. A fully custom-colored (e.g. orange) titlebar isn't
-        something Windows exposes to a normal app without replacing the
-        whole window frame and reimplementing drag/resize/snap by
-        hand, which is a much bigger, riskier undertaking than this."""
+    def _apply_windows_titlebar_mode(self, window: tk.Misc) -> None:
+        """Switches a window's native title bar (the strip with the
+        window title and minimize/maximize/close buttons -- Tkinter has
+        no way to draw or recolor that itself, it's OS chrome) into or
+        out of Windows' own dark mode, via the same undocumented DWM
+        attribute apps like Discord and Spotify use for their dark
+        titlebars. Follows the *current* theme's brightness (see
+        theme.current_is_dark()) rather than always forcing dark, so
+        the Light preset gets a light titlebar too -- and takes any
+        window, not just the main one, so every popup opened through
+        _toplevel() matches instead of showing Windows' default white
+        titlebar against a dark theme. Called again on every live theme
+        switch (see _apply_theme_to_live_widgets) so the main window's
+        titlebar updates without a restart. This can't be tested from
+        the Linux dev sandbox, only on Ryan's actual Windows machine --
+        it's a no-op (silently, safely) anywhere else, including older
+        Windows builds without this attribute. A fully custom-colored
+        (e.g. orange) titlebar isn't something Windows exposes to a
+        normal app without replacing the whole window frame and
+        reimplementing drag/resize/snap by hand, which is a much
+        bigger, riskier undertaking than this."""
         if not sys.platform.startswith("win"):
             return
         try:
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            dark_mode = ctypes.c_int(1)
+            window.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+            dark_mode = ctypes.c_int(1 if theme.current_is_dark() else 0)
             DWMWA_USE_IMMERSIVE_DARK_MODE = 20
             result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(dark_mode), ctypes.sizeof(dark_mode)
@@ -119,18 +149,74 @@ class MainWindow(tk.Tk):
                     hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, ctypes.byref(dark_mode), ctypes.sizeof(dark_mode)
                 )
         except Exception:
-            pass  # never let a titlebar cosmetic fail startup
+            pass  # never let a titlebar cosmetic fail startup / a popup open
 
     def _apply_app_icon(self) -> None:
         """Sets the window/taskbar icon from assets/icon.ico if that
         file exists next to the app. Safe no-op if it doesn't -- so
-        this can be wired up ahead of actually having an icon file."""
-        icon_path = os.path.join(os.getcwd(), "assets", "icon.ico")
-        if os.path.exists(icon_path):
-            try:
-                self.iconbitmap(icon_path)
-            except tk.TclError:
-                pass
+        this can be wired up ahead of actually having an icon file.
+
+        Calls iconbitmap() TWICE, on purpose, each in its OWN
+        try/except so one failing can never suppress the other:
+        1. Plain `self.iconbitmap(icon_path)` -- sets *this* window's
+           own icon. This is the call that actually reaches the
+           Windows taskbar; confirmed live (2026-09-04) that using
+           only the `default=` form below left the taskbar showing
+           Tk's stock feather icon even though the call itself
+           succeeded with no error. This matches a documented Tk
+           quirk (the Tcler's Wiki page for "wm iconbitmap" notes that
+           "-default" alone can make the icon disappear from the
+           taskbar specifically) -- not a guess.
+        2. `self.iconbitmap(default=icon_path)` -- per Tk's own `wm
+           iconbitmap` docs, this additionally makes it the *default*
+           icon for every Toplevel opened under this window that
+           doesn't set its own, which is what lets every popup
+           (_toplevel()) automatically pick up LCBot's icon instead of
+           Tk's stock feather icon, with nothing needed at each call
+           site. Since step 1 already gave this window its own
+           specific icon, this second call only affects windows that
+           don't have one yet (i.e. every future popup) -- it doesn't
+           undo step 1.
+
+        Split into two separate try/except blocks rather than one
+        shared one, confirmed necessary (not just defensive) by dev
+        testing on Linux: Tk's `iconbitmap`/`iconbitmap(default=...)`
+        only accept a real .ico file on Windows -- on X11 both forms
+        require the old monochrome XBM bitmap format instead, so
+        `self.iconbitmap(icon_path)` raises `TclError: bitmap "...ico"
+        not defined` on this dev sandbox every time, regardless of
+        `default=`. That's an X11-only limitation (not something
+        Windows shares -- Tk's own docs say a real Windows .ico/.icr
+        file is accepted there for both forms), and LCBot only ever
+        runs as a real app on Windows, but a single shared try/except
+        would have let that first, expected-to-sometimes-fail call
+        silently swallow the second call too on any platform where it
+        legitimately fails -- so each gets its own block, and each
+        failure is logged separately instead of assumed harmless.
+
+        Uses app_dir() (the exe's own folder, not whatever the OS
+        happened to set as the working directory -- see paths.py)
+        rather than os.getcwd() directly, since a desktop shortcut
+        without its own "Start in" folder, or a launcher script, can
+        hand the process a working directory that isn't actually the
+        exe's own folder even though the exe itself runs fine from
+        wherever it sits. Logs (to lcbot.log, since a --windowed build
+        has no visible console) rather than staying silent if the file
+        genuinely isn't found or Tk rejects it, so a future taskbar/
+        titlebar icon report has something to check instead of pure
+        guesswork."""
+        icon_path = os.path.join(app_dir(), "assets", "icon.ico")
+        if not os.path.exists(icon_path):
+            logger.warning("app icon not found at %s -- taskbar/titlebar will use Tk's default icon", icon_path)
+            return
+        try:
+            self.iconbitmap(icon_path)
+        except tk.TclError:
+            logger.exception("Tk rejected the app icon (window-specific form) at %s", icon_path)
+        try:
+            self.iconbitmap(default=icon_path)
+        except tk.TclError:
+            logger.exception("Tk rejected the app icon (default-for-popups form) at %s", icon_path)
 
     # -- toolbar ---------------------------------------------------------
     def _build_toolbar(self) -> None:
@@ -145,16 +231,22 @@ class MainWindow(tk.Tk):
         toolbar = ttk.Frame(self, style="Toolbar.TFrame")
         toolbar.pack(side="top", fill="x")
 
-        cred_menu = tk.Menu(self, tearoff=0, **theme.popup_menu_kwargs())
-        cred_menu.add_command(label="Twitch / YouTube credentials...",
-                               command=lambda: self.notebook.select(self.settings_tab))
-        ttk.Menubutton(toolbar, text="Credentials", menu=cred_menu, style="Toolbar.TMenubutton").pack(
+        # Stored on self (rather than left as locals) so a theme switch
+        # can recolor them after the fact -- see
+        # _apply_theme_to_live_widgets. tk.Menu predates ttk and
+        # doesn't pick up ttk.Style automatically.
+        self.cred_menu = tk.Menu(self, tearoff=0, **theme.popup_menu_kwargs())
+        self.cred_menu.add_command(label="Twitch / YouTube credentials...",
+                                    command=lambda: self.notebook.select(self.settings_tab))
+        ttk.Menubutton(toolbar, text="Credentials", menu=self.cred_menu, style="Toolbar.TMenubutton").pack(
             side="left", padx=(4, 0), pady=2
         )
 
-        help_menu = tk.Menu(self, tearoff=0, **theme.popup_menu_kwargs())
-        help_menu.add_command(label="About", command=self._show_about)
-        ttk.Menubutton(toolbar, text="Help", menu=help_menu, style="Toolbar.TMenubutton").pack(
+        self.help_menu = tk.Menu(self, tearoff=0, **theme.popup_menu_kwargs())
+        self.help_menu.add_command(label="About", command=self._show_about)
+        self.help_menu.add_command(label="Support / buy me a coffee", command=self._show_support_popup)
+        self.help_menu.add_command(label="Check for updates", command=lambda: self._check_for_update(manual=True))
+        ttk.Menubutton(toolbar, text="Help", menu=self.help_menu, style="Toolbar.TMenubutton").pack(
             side="left", padx=(2, 0), pady=2
         )
 
@@ -166,6 +258,54 @@ class MainWindow(tk.Tk):
             "before it became Streamlabs Chatbot. No cloud account, "
             "no subscription -- everything runs and is stored locally.",
         )
+
+    # -- update check ----------------------------------------------------
+    def _check_for_update(self, manual: bool = False) -> None:
+        """Checks GitHub for a newer release in the background. Silent
+        on failure (see update_check.py) unless manual=True (the Help
+        menu's "Check for updates" item), in which case a "you're up to
+        date" popup confirms the check actually ran -- the same
+        "explain what happened" reasoning as everywhere else errors got
+        friendlier this round, just applied to a non-error outcome."""
+        def worker():
+            result = update_check.check_for_update(__version__)
+            self._event_queue.put(("update_check_result", (result, manual)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_update_url(self) -> None:
+        if self._update_url:
+            webbrowser.open(self._update_url)
+
+    # -- support / donate popup -------------------------------------------
+    def _maybe_show_support_popup(self) -> None:
+        if self.db.get_setting_bool("hide_support_popup", False):
+            return
+        # Give the main window a moment to actually appear first,
+        # rather than popping this up mid-launch.
+        self.after(2500, self._show_support_popup)
+
+    def _show_support_popup(self) -> None:
+        win = self._toplevel("Support LCBot", "360x220")
+        win.resizable(False, False)
+        ttk.Label(win, text="Enjoying LCBot?", style="Heading.TLabel").pack(padx=20, pady=(20, 6))
+        ttk.Label(
+            win,
+            text="If it's been useful for your stream, consider\nbuying me a coffee to help keep it going.",
+            justify="center",
+        ).pack(padx=20)
+        ttk.Button(
+            win, text="☕ Buy me a coffee", command=lambda: webbrowser.open(SUPPORT_URL)
+        ).pack(pady=16)
+
+        dont_show_var = tk.BooleanVar(value=self.db.get_setting_bool("hide_support_popup", False))
+
+        def on_toggle():
+            self.db.set_setting("hide_support_popup", "1" if dont_show_var.get() else "0")
+
+        ttk.Checkbutton(
+            win, text="Don't show this again", variable=dont_show_var, command=on_toggle
+        ).pack(pady=(0, 8))
+        ttk.Button(win, text="Close", command=win.destroy).pack()
 
     # -- layout -----------------------------------------------------------
     def _build_ui(self) -> None:
@@ -184,11 +324,21 @@ class MainWindow(tk.Tk):
         self.viewers_label = ttk.Label(top, text="", style="Muted.TLabel")
         self.viewers_label.pack(side="left", padx=10)
 
-        # An orange-bordered frame around the notebook echoes the frame
-        # AnkhBot draws around its whole tab body.
-        border = tk.Frame(self, bg="#e8720c")
+        # Hidden until check_for_update finds something -- see
+        # _check_for_update / _drain_queue's "update_available" branch.
+        self.update_label = ttk.Label(top, text="", style="UpdateAvailable.TLabel", cursor="hand2")
+        self.update_label.pack(side="right", padx=10)
+        self.update_label.bind("<Button-1>", lambda e: self._open_update_url())
+        self._update_url = ""
+
+        # An accent-bordered frame around the notebook echoes the frame
+        # AnkhBot draws around its whole tab body. Plain tk.Frame (not
+        # ttk), so its bg needs to be told again after a theme switch
+        # -- see _apply_theme_to_live_widgets -- rather than picking up
+        # ttk.Style changes automatically.
+        self._theme_border_frame = border = tk.Frame(self, bg=theme.ACCENT)
         border.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        inner = tk.Frame(border, bg="#1a1a1a")
+        self._theme_inner_frame = inner = tk.Frame(border, bg=theme.BG)
         inner.pack(fill="both", expand=True, padx=2, pady=2)
 
         self.notebook = notebook = ttk.Notebook(inner)
@@ -209,6 +359,7 @@ class MainWindow(tk.Tk):
         self.queue_tab = ttk.Frame(notebook)
         self.users_tab = ttk.Frame(notebook)
         self.settings_tab = ttk.Frame(notebook)
+        self.themes_tab = ttk.Frame(notebook)
 
         for tab, label in [
             (self.console_tab, "Console"), (self.dashboard_tab, "Dashboard"),
@@ -218,7 +369,7 @@ class MainWindow(tk.Tk):
             (self.minigames_tab, "Mini Games"), (self.moderation_tab, "Moderation"),
             (self.event_tab, "Events"), (self.songs_tab, "Song Req"),
             (self.queue_tab, "Queue"), (self.users_tab, "Users"),
-            (self.settings_tab, "Settings"),
+            (self.settings_tab, "Settings"), (self.themes_tab, "Themes"),
         ]:
             notebook.add(tab, text=label)
 
@@ -237,6 +388,7 @@ class MainWindow(tk.Tk):
         self._build_queue_tab()
         self._build_users_tab()
         self._build_settings_tab()
+        self._build_themes_tab()
 
     # -- console ------------------------------------------------------
     def _build_console_tab(self) -> None:
@@ -249,16 +401,7 @@ class MainWindow(tk.Tk):
         style_text_widget(self.chat_log)
         self._chat_color_tags: set[str] = set()
         self._chat_click_tags: set[str] = set()
-        self.chat_log.tag_configure(
-            "timestamp", foreground=theme.MUTED_FG, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE - 3)
-        )
-        self.chat_log.tag_configure("username", foreground=theme.FG, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE, "bold"))
-        self.chat_log.tag_configure(
-            "system", foreground=theme.MUTED_FG, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE - 1, "italic")
-        )
-        self.chat_log.tag_configure(
-            "outgoing_prefix", foreground=theme.ACCENT, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE, "bold")
-        )
+        self._configure_chat_log_tags()
         # Pack the send row FIRST, pinned to the bottom, before the chat
         # log. Tk's pack() carves out each widget's space in the order
         # it's packed -- packing the expanding, fill="both" Text widget
@@ -477,6 +620,25 @@ class MainWindow(tk.Tk):
         else:
             self.bot.send_chat(text)
         self.send_entry.delete(0, "end")
+
+    def _configure_chat_log_tags(self) -> None:
+        """The chat log's non-per-user text tags (timestamps, the
+        username tag's default styling, system messages, the "> "
+        outgoing-message prefix). Split out from _build_console_tab so
+        a theme switch can re-run just this part -- the per-user color
+        tags (see _chat_color_tags) are assigned from a fixed palette
+        that's meant to stay stable across theme switches, so those
+        aren't touched here."""
+        self.chat_log.tag_configure(
+            "timestamp", foreground=theme.MUTED_FG, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE - 3)
+        )
+        self.chat_log.tag_configure("username", foreground=theme.FG, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE, "bold"))
+        self.chat_log.tag_configure(
+            "system", foreground=theme.MUTED_FG, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE - 1, "italic")
+        )
+        self.chat_log.tag_configure(
+            "outgoing_prefix", foreground=theme.ACCENT, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE, "bold")
+        )
 
     # -- dashboard (quick stats) ---------------------------------------
     def _build_dashboard_tab(self) -> None:
@@ -1320,17 +1482,21 @@ class MainWindow(tk.Tk):
         ttk.Checkbutton(form, text="Song requests enabled", variable=self.songrequests_enabled_var).grid(
             row=len(fields), column=0, sticky="w"
         )
-        ttk.Button(form, text="Save", command=self._save_song_settings).grid(row=len(fields) + 1, column=0, pady=6, sticky="w")
+
+        ttk.Button(form, text="Save", command=self._save_song_settings).grid(
+            row=len(fields) + 1, column=0, pady=(10, 0), sticky="w"
+        )
         self.song_saved_label = ttk.Label(form, text="", style="Muted.TLabel")
-        self.song_saved_label.grid(row=len(fields) + 1, column=1, sticky="w", padx=8)
+        self.song_saved_label.grid(row=len(fields) + 1, column=1, sticky="w", padx=8, pady=(10, 0))
         ttk.Label(
             frame,
-            text="In OBS/Streamlabs Desktop, add a Browser Source, leave \"Local file\" "
-                 f"UNCHECKED, and set the URL to http://localhost:{overlay_server.DEFAULT_PORT}/song_overlay.html "
+            text="Browser Source overlay: in OBS/Streamlabs Desktop, add a Browser Source, leave "
+                 "\"Local file\" UNCHECKED, and set the URL to "
+                 f"http://localhost:{overlay_server.DEFAULT_PORT}/song_overlay.html "
                  "-- the bot is serving it while this app is open. (\"Local file\" mode can't "
                  "see the live now-playing state due to browser security, so it'll look blank.)",
             style="Muted.TLabel", wraplength=900,
-        ).pack(anchor="w", padx=8)
+        ).pack(anchor="w", padx=8, pady=(4, 0))
 
         self.now_playing_label = ttk.Label(frame, text="Now playing: (nothing)", style="Heading.TLabel")
         self.now_playing_label.pack(anchor="w", padx=8, pady=(8, 0))
@@ -1342,7 +1508,9 @@ class MainWindow(tk.Tk):
 
         btns = ttk.Frame(frame)
         btns.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(btns, text="Skip Current", command=lambda: self._call_bot(self.bot.songrequests.tick)).pack(side="left")
+        ttk.Button(btns, text="Skip Current", command=lambda: self._call_bot(self.bot.songrequests.skip_current)).pack(
+            side="left"
+        )
         ttk.Button(btns, text="Clear Queue", command=self._clear_song_queue).pack(side="left", padx=4)
         ttk.Button(btns, text="Refresh", command=self._refresh_songs).pack(side="right")
         self._refresh_songs()
@@ -1362,9 +1530,11 @@ class MainWindow(tk.Tk):
         for row in self.db.queued_songs():
             self.songqueue_tree.insert("", "end", values=(row["title"], row["requested_by"]))
         np = self.bot.songrequests.now_playing
-        self.now_playing_label.configure(
-            text=f"Now playing: {np['title']} ({np['requested_by']})" if np else "Now playing: (nothing)"
-        )
+        if not np:
+            text = "Now playing: (nothing)"
+        else:
+            text = f"Now playing: {np['title']} ({np['requested_by']})"
+        self.now_playing_label.configure(text=text)
 
     def _call_bot(self, fn) -> None:
         fn()
@@ -1474,10 +1644,66 @@ class MainWindow(tk.Tk):
             self.db.set_points(sel[0], amount)
             self._refresh_users()
 
+    # -- scrollable tabs -----------------------------------------------
+    def _make_scrollable(self, parent: tk.Widget, padding: int = 10) -> tuple[tk.Canvas, ttk.Frame]:
+        """Wraps a notebook tab's content in a vertically-scrolling
+        Canvas, so a tab that's grown taller than the window (Settings,
+        with its Connection/Alerts/Backup/Discord sections, was the
+        first to need this -- Ryan had to resize the window just to
+        reach "Save Settings") doesn't need the window resized to see
+        everything. Returns (canvas, inner_frame); build the tab's
+        actual content into inner_frame exactly as before this existed.
+        Call _bind_mousewheel_recursive(inner_frame, canvas) once the
+        content is built, and stash the canvas on self so a theme
+        switch can recolor it (see _apply_theme_to_live_widgets) --
+        it's a plain tk.Canvas, not a ttk widget, so it doesn't pick up
+        a new theme's background on its own."""
+        container = ttk.Frame(parent)
+        container.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(container, bg=theme.BG, highlightthickness=0)
+        vscroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas, padding=padding)
+        inner_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def on_inner_configure(event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner.bind("<Configure>", on_inner_configure)
+
+        def on_canvas_configure(event) -> None:
+            # Keeps the inner frame exactly as wide as the visible
+            # canvas (so labels/entries don't get clipped or leave a
+            # dead strip on the right) while height stays free to grow
+            # past the window and scroll.
+            canvas.itemconfigure(inner_window, width=event.width)
+
+        canvas.bind("<Configure>", on_canvas_configure)
+        return canvas, inner
+
+    def _bind_mousewheel_recursive(self, widget: tk.Widget, canvas: tk.Canvas) -> None:
+        """Makes the mouse wheel scroll `canvas` no matter which child
+        widget the pointer happens to be over. Tk delivers <MouseWheel>
+        to the specific widget under the pointer, not to ancestors, so
+        binding it only on the canvas itself leaves scrolling dead
+        everywhere the pointer is actually likely to be -- over a
+        label, an entry, a checkbutton. Safe to bind broadly: nothing
+        in these tabs (no Spinbox/Combobox-style "wheel changes the
+        value" widgets) already uses the wheel for anything else."""
+        def on_mousewheel(event, c=canvas) -> None:
+            c.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        widget.bind("<MouseWheel>", on_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_mousewheel_recursive(child, canvas)
+
     # -- settings ----------------------------------------------------
     def _build_settings_tab(self) -> None:
-        frame = ttk.Frame(self.settings_tab, padding=10)
-        frame.pack(fill="both", expand=True)
+        self._settings_canvas, frame = self._make_scrollable(self.settings_tab)
         cfg = self.config_store.data
 
         self.settings_vars: dict[str, tk.StringVar] = {}
@@ -1497,17 +1723,30 @@ class MainWindow(tk.Tk):
         row("Twitch channel to join", "channel", r=r); r += 1
         row("Bot account username", "bot_username", r=r); r += 1
         row("Bot chat OAuth token", "oauth_token", secret=True, r=r)
-        ttk.Button(frame, text="Get chat token via browser", command=self._authorize_chat).grid(row=r, column=2, padx=6)
-        r += 1
-
-        ttk.Label(frame, text="Twitch Developer App (for stream info)", style="Heading.TLabel").grid(
-            row=r, column=0, sticky="w", pady=(12, 4)
+        ttk.Button(frame, text="Log in with Twitch (bot account)", command=self._authorize_chat).grid(
+            row=r, column=2, padx=6
         )
         r += 1
-        row("Client ID", "client_id", r=r); r += 1
-        row("Client Secret", "client_secret", secret=True, r=r); r += 1
+
+        ttk.Label(
+            frame, text="Streamer account (stream info, alerts, title/game updates)", style="Heading.TLabel"
+        ).grid(row=r, column=0, sticky="w", pady=(12, 4))
+        r += 1
+        ttk.Label(
+            frame,
+            text="Just click \"Log in with Twitch\" below -- no separate Twitch Dev\n"
+                 "Console signup needed, LCBot handles that part itself. The Client\n"
+                 "ID/Secret fields are optional, only for someone who'd rather use\n"
+                 "their own registered Twitch app instead of LCBot's built-in one.",
+            style="Muted.TLabel", justify="left",
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        row("Client ID (optional, advanced)", "client_id", r=r); r += 1
+        row("Client Secret (optional, advanced)", "client_secret", secret=True, r=r); r += 1
         row("Broadcaster access token", "helix_access_token", secret=True, r=r)
-        ttk.Button(frame, text="Authorize (broadcaster)", command=self._authorize_helix).grid(row=r, column=2, padx=6)
+        ttk.Button(frame, text="Log in with Twitch (streamer account)", command=self._authorize_helix).grid(
+            row=r, column=2, padx=6
+        )
         r += 1
 
         ttk.Label(frame, text="Song Requests", style="Heading.TLabel").grid(row=r, column=0, sticky="w", pady=(12, 4))
@@ -1541,9 +1780,95 @@ class MainWindow(tk.Tk):
         )
         r += 1
 
+        # -- Chat Alerts (follow/sub/raid) -----------------------------
+        # Unlike the fields above, these live in the database's settings
+        # table (self.db), not config.json -- they're behavior/content
+        # config, not connection secrets, same split as e.g. the
+        # currency name or moderation thresholds elsewhere in the app.
+        ttk.Label(frame, text="Chat Alerts", style="Heading.TLabel").grid(
+            row=r, column=0, sticky="w", pady=(12, 4)
+        )
+        r += 1
+        self.alerts_enabled_var = tk.BooleanVar(value=self.db.get_setting_bool("alerts_enabled", True))
+        ttk.Checkbutton(
+            frame, text="Announce follows, subs, and raids in chat", variable=self.alerts_enabled_var
+        ).grid(row=r, column=0, sticky="w")
+        r += 1
+
+        self.alerts_type_vars: dict[str, tk.BooleanVar] = {}
+        self.alerts_message_vars: dict[str, tk.StringVar] = {}
+
+        def template_row(label_text, message_key, placeholders, indent=16):
+            nonlocal r
+            ttk.Label(frame, text=label_text).grid(row=r, column=0, sticky="w", padx=(indent, 0))
+            msg_var = tk.StringVar(value=self.db.get_setting(message_key, "") or "")
+            self.alerts_message_vars[message_key] = msg_var
+            ttk.Entry(frame, textvariable=msg_var, width=40).grid(row=r, column=1, sticky="w", padx=8)
+            ttk.Label(frame, text=placeholders, style="Muted.TLabel").grid(row=r, column=2, sticky="w")
+            r += 1
+
+        follow_var = tk.BooleanVar(value=self.db.get_setting_bool("alerts_follow_enabled", True))
+        self.alerts_type_vars["alerts_follow_enabled"] = follow_var
+        ttk.Checkbutton(frame, text="New followers", variable=follow_var).grid(row=r, column=0, sticky="w")
+        r += 1
+        template_row("Message:", "alerts_follow_message", "{user}")
+
+        sub_var = tk.BooleanVar(value=self.db.get_setting_bool("alerts_sub_enabled", True))
+        self.alerts_type_vars["alerts_sub_enabled"] = sub_var
+        ttk.Checkbutton(frame, text="New subs, resubs & gift subs", variable=sub_var).grid(
+            row=r, column=0, sticky="w"
+        )
+        r += 1
+        template_row("Sub message:", "alerts_sub_message", "{user}")
+        template_row("Resub message:", "alerts_resub_message", "{user} {months}")
+        template_row("Gift sub message:", "alerts_subgift_message", "{user} {recipient}")
+
+        raid_var = tk.BooleanVar(value=self.db.get_setting_bool("alerts_raid_enabled", True))
+        self.alerts_type_vars["alerts_raid_enabled"] = raid_var
+        ttk.Checkbutton(frame, text="Raids", variable=raid_var).grid(row=r, column=0, sticky="w")
+        r += 1
+        template_row("Message:", "alerts_raid_message", "{user} {viewers}")
+
+        # -- Backup & Restore --------------------------------------------
+        ttk.Label(frame, text="Backup & Restore", style="Heading.TLabel").grid(
+            row=r, column=0, sticky="w", pady=(12, 4)
+        )
+        r += 1
+        ttk.Label(
+            frame,
+            text="Backups are saved as .lcbotbak files -- LCBot's own format, so the\n"
+                 "restore picker won't let you accidentally pick the wrong file. It's\n"
+                 "just your database in a labeled zip -- nothing stops you opening it.",
+            style="Muted.TLabel", justify="left",
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        backup_btn_frame = ttk.Frame(frame)
+        backup_btn_frame.grid(row=r, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Button(backup_btn_frame, text="Backup Now...", command=self._backup_now).pack(side="left")
+        ttk.Button(
+            backup_btn_frame, text="Restore from Backup...", command=self._restore_backup
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            backup_btn_frame, text="Export My Data (JSON)...", command=self._export_portable_json
+        ).pack(side="left", padx=8)
+        r += 1
+        self.backup_status_label = ttk.Label(frame, text="", style="Muted.TLabel")
+        self.backup_status_label.grid(row=r, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        r += 1
+        ttk.Label(
+            frame,
+            text="Want your data in a format any program can read, not just LCBot?\n"
+                 "\"Export My Data\" writes a plain JSON file instead -- your commands,\n"
+                 "points, quotes, and timers, nothing LCBot-specific about it.",
+            style="Muted.TLabel", justify="left",
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+
         ttk.Button(frame, text="Save Settings", command=self._save_settings).grid(row=r, column=0, pady=16, sticky="w")
         self.settings_saved_label = ttk.Label(frame, text="", style="Muted.TLabel")
         self.settings_saved_label.grid(row=r, column=1, sticky="w", padx=8)
+
+        self._bind_mousewheel_recursive(frame, self._settings_canvas)
 
     def _save_settings(self) -> None:
         values = {k: v.get() for k, v in self.settings_vars.items()}
@@ -1551,7 +1876,370 @@ class MainWindow(tk.Tk):
         values["discord_announce_enabled"] = self.discord_enabled_var.get()
         self.config_store.update(**values)
         self.bot.refresh_apis()
+
+        self.db.set_setting("alerts_enabled", "1" if self.alerts_enabled_var.get() else "0")
+        for key, var in self.alerts_type_vars.items():
+            self.db.set_setting(key, "1" if var.get() else "0")
+        for key, var in self.alerts_message_vars.items():
+            self.db.set_setting(key, var.get())
+
         self._flash_saved(self.settings_saved_label)
+
+    # -- themes -------------------------------------------------------
+    def _build_themes_tab(self) -> None:
+        self._themes_canvas, frame = self._make_scrollable(self.themes_tab, padding=14)
+
+        ttk.Label(frame, text="Theme", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            frame,
+            text="Pick a look for the app -- \"Classic\" is the original AnkhBot\n"
+                 "black-and-orange look. Applying updates the app immediately;\n"
+                 "a couple of spots (popup menus, already-open dialogs) pick up\n"
+                 "the change next time they're opened rather than instantly.",
+            style="Muted.TLabel", justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 12))
+
+        current_label = theme.THEME_LABELS.get(self._current_theme_name, theme.THEME_LABELS["classic"])
+        self.theme_choice_var = tk.StringVar(value=current_label)
+        theme_combo = ttk.Combobox(
+            frame, textvariable=self.theme_choice_var, state="readonly", width=26,
+            values=[theme.THEME_LABELS[k] for k in theme.THEME_ORDER],
+        )
+        theme_combo.grid(row=2, column=0, sticky="w")
+        theme_combo.bind("<<ComboboxSelected>>", self._on_theme_choice_changed)
+
+        self.theme_swatch_frame = ttk.Frame(frame)
+        self.theme_swatch_frame.grid(row=2, column=1, sticky="w", padx=12)
+
+        # -- Custom colors ---------------------------------------------
+        self.custom_theme_frame = ttk.LabelFrame(
+            frame, text='Custom colors (used when "Custom" is selected above)', padding=10
+        )
+        self.custom_theme_frame.grid(row=3, column=0, columnspan=4, sticky="w", pady=(16, 0))
+
+        saved_custom = theme.parse_custom_colors(self.db.get_setting("theme_custom_colors", ""))
+        classic = theme.PRESETS["classic"]
+        initial_bg, initial_fg, initial_accent = saved_custom or (classic["BG"], classic["FG"], classic["ACCENT"])
+        self.custom_color_vars: dict[str, tk.StringVar] = {
+            "BG": tk.StringVar(value=initial_bg),
+            "FG": tk.StringVar(value=initial_fg),
+            "ACCENT": tk.StringVar(value=initial_accent),
+        }
+        self._custom_swatches: dict[str, tk.Label] = {}
+
+        def color_row(r: int, key: str, label_text: str) -> None:
+            ttk.Label(self.custom_theme_frame, text=label_text).grid(row=r, column=0, sticky="w", pady=3)
+            swatch = tk.Label(
+                self.custom_theme_frame, width=3, relief="solid", borderwidth=1,
+                bg=self.custom_color_vars[key].get(),
+            )
+            swatch.grid(row=r, column=1, padx=(8, 4))
+            self._custom_swatches[key] = swatch
+            ttk.Entry(self.custom_theme_frame, textvariable=self.custom_color_vars[key], width=10).grid(
+                row=r, column=2, padx=(0, 4)
+            )
+
+            def pick() -> None:
+                chosen = colorchooser.askcolor(
+                    color=self.custom_color_vars[key].get(), title=label_text, parent=self
+                )[1]
+                if chosen:
+                    self.custom_color_vars[key].set(chosen)
+
+            ttk.Button(self.custom_theme_frame, text="Pick...", command=pick).grid(row=r, column=3)
+
+            def on_change(*_args, k=key, sw=swatch) -> None:
+                val = self.custom_color_vars[k].get()
+                if theme.is_valid_hex_color(val):
+                    sw.configure(bg=val)
+                if self._theme_key_from_label(self.theme_choice_var.get()) == "custom":
+                    self._update_theme_swatches()
+
+            self.custom_color_vars[key].trace_add("write", on_change)
+
+        color_row(0, "BG", "Background")
+        color_row(1, "FG", "Text")
+        color_row(2, "ACCENT", "Accent")
+
+        ttk.Label(
+            self.custom_theme_frame,
+            text="Everything else (panels, muted text, tab colors, selection\n"
+                 "highlight) is worked out automatically from these three.",
+            style="Muted.TLabel", justify="left",
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # -- Saved custom profiles --------------------------------------
+        # Separate from theme_custom_colors (whatever's currently in the
+        # pickers above) -- these are up to 3 named slots you can save a
+        # custom scheme into and switch back to later with one click,
+        # instead of having only ever "the one" custom scheme.
+        self.profile_frame = ttk.LabelFrame(frame, text="Saved Custom Profiles", padding=10)
+        self.profile_frame.grid(row=4, column=0, columnspan=4, sticky="w", pady=(16, 0))
+        ttk.Label(
+            self.profile_frame,
+            text="Save up to 3 of your own custom color schemes, then switch\n"
+                 "between them with one click -- \"Save\" copies whatever's\n"
+                 "currently in the Background/Text/Accent fields above into\n"
+                 "that slot; \"Load\" brings a saved slot back and applies it.",
+            style="Muted.TLabel", justify="left",
+        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+
+        self._profile_swatches: dict[int, tk.Label] = {}
+        self._profile_status_labels: dict[int, ttk.Label] = {}
+        self._profile_load_buttons: dict[int, ttk.Button] = {}
+
+        for i in range(1, 4):
+            r = i  # row 0 in profile_frame is the intro label above
+            ttk.Label(self.profile_frame, text=f"Profile {i}", width=10).grid(row=r, column=0, sticky="w", pady=3)
+            swatch = tk.Label(self.profile_frame, width=3, relief="solid", borderwidth=1, bg=theme.PANEL_BG)
+            swatch.grid(row=r, column=1, padx=(4, 8))
+            self._profile_swatches[i] = swatch
+            status = ttk.Label(self.profile_frame, text="(empty)", style="Muted.TLabel", width=8)
+            status.grid(row=r, column=2, sticky="w")
+            self._profile_status_labels[i] = status
+            ttk.Button(
+                self.profile_frame, text="Save current colors here",
+                command=lambda slot=i: self._save_theme_profile(slot),
+            ).grid(row=r, column=3, padx=(8, 4))
+            load_btn = ttk.Button(
+                self.profile_frame, text="Load", command=lambda slot=i: self._load_theme_profile(slot)
+            )
+            load_btn.grid(row=r, column=4)
+            self._profile_load_buttons[i] = load_btn
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=5, column=0, columnspan=4, sticky="w", pady=(16, 0))
+        ttk.Button(btn_row, text="Apply Theme", command=self._apply_theme_from_ui).pack(side="left")
+        self.theme_saved_label = ttk.Label(btn_row, text="", style="Muted.TLabel")
+        self.theme_saved_label.pack(side="left", padx=(8, 0))
+
+        self._update_theme_swatches()
+        self._refresh_theme_profile_ui()
+        self._bind_mousewheel_recursive(frame, self._themes_canvas)
+
+    def _theme_key_from_label(self, label: str) -> str:
+        for key, text_ in theme.THEME_LABELS.items():
+            if text_ == label:
+                return key
+        return "classic"
+
+    def _current_custom_colors_from_ui(self) -> dict[str, str]:
+        bg = self.custom_color_vars["BG"].get()
+        fg = self.custom_color_vars["FG"].get()
+        accent = self.custom_color_vars["ACCENT"].get()
+        return theme.build_custom_colors(bg, fg, accent)
+
+    def _on_theme_choice_changed(self, event=None) -> None:
+        self._update_theme_swatches()
+
+    def _update_theme_swatches(self) -> None:
+        """A small strip of colored squares next to the theme dropdown
+        previewing the currently-selected theme's key colors, so
+        picking from the dropdown (or tweaking a custom color) shows
+        something before hitting Apply."""
+        key = self._theme_key_from_label(self.theme_choice_var.get())
+        colors = self._current_custom_colors_from_ui() if key == "custom" else theme.PRESETS[key]
+        for widget in self.theme_swatch_frame.winfo_children():
+            widget.destroy()
+        for color_key in ("BG", "PANEL_BG", "ACCENT", "FG"):
+            tk.Label(
+                self.theme_swatch_frame, width=2, relief="solid", borderwidth=1, bg=colors[color_key]
+            ).pack(side="left", padx=1)
+
+    def _apply_theme_from_ui(self) -> None:
+        key = self._theme_key_from_label(self.theme_choice_var.get())
+        if key == "custom":
+            bg = self.custom_color_vars["BG"].get()
+            fg = self.custom_color_vars["FG"].get()
+            accent = self.custom_color_vars["ACCENT"].get()
+            if not all(theme.is_valid_hex_color(c) for c in (bg, fg, accent)):
+                messagebox.showerror(
+                    "Theme", "Custom colors need to be valid hex codes, like #1a1a1a -- "
+                             "use \"Pick...\" if you're not sure of the format."
+                )
+                return
+            colors = theme.build_custom_colors(bg, fg, accent)
+            self.db.set_setting("theme_custom_colors", theme.serialize_custom_colors(bg, fg, accent))
+        else:
+            colors = theme.PRESETS[key]
+        self.db.set_setting("theme_name", key)
+        self._current_theme_name = key
+        self._apply_theme_to_live_widgets(colors)
+        self._update_theme_swatches()
+        self._flash_saved(self.theme_saved_label, "Theme applied!")
+
+    def _save_theme_profile(self, slot: int) -> None:
+        """Copies whatever's currently in the Background/Text/Accent
+        pickers into Saved Custom Profiles slot `slot` (1-3) -- doesn't
+        touch theme_custom_colors or switch/apply the active theme, so
+        saving a profile is safe to do at any point regardless of
+        which theme is actually applied right now."""
+        bg = self.custom_color_vars["BG"].get()
+        fg = self.custom_color_vars["FG"].get()
+        accent = self.custom_color_vars["ACCENT"].get()
+        if not all(theme.is_valid_hex_color(c) for c in (bg, fg, accent)):
+            messagebox.showerror(
+                "Theme Profiles",
+                "Custom colors need to be valid hex codes, like #1a1a1a, before "
+                "saving them to a profile -- use \"Pick...\" if you're not sure of the format.",
+            )
+            return
+        self.db.set_setting(f"theme_profile_{slot}", theme.serialize_custom_colors(bg, fg, accent))
+        self._refresh_theme_profile_ui()
+        self._flash_saved(self.theme_saved_label, f"Saved to Profile {slot}!")
+
+    def _load_theme_profile(self, slot: int) -> None:
+        """Brings Saved Custom Profiles slot `slot` back into the
+        Background/Text/Accent pickers, switches the theme dropdown to
+        Custom, and applies it immediately -- one click to switch back
+        to a saved look, rather than load-then-remember-to-hit-Apply.
+        The Load button for an empty slot is disabled (see
+        _refresh_theme_profile_ui), so the "nothing saved" case here is
+        just a safety net, not the normal path."""
+        parsed = theme.parse_custom_colors(self.db.get_setting(f"theme_profile_{slot}", ""))
+        if parsed is None:
+            return
+        bg, fg, accent = parsed
+        self.custom_color_vars["BG"].set(bg)
+        self.custom_color_vars["FG"].set(fg)
+        self.custom_color_vars["ACCENT"].set(accent)
+        self.theme_choice_var.set(theme.THEME_LABELS["custom"])
+        self._apply_theme_from_ui()
+        self._flash_saved(self.theme_saved_label, f"Loaded Profile {slot}!")
+
+    def _refresh_theme_profile_ui(self) -> None:
+        """Updates each profile slot's swatch/status text and enables
+        or disables its Load button based on whether that slot's
+        actually been saved to -- called once when the Themes tab is
+        built, again after every Save (so a freshly-saved slot's Load
+        button lights up immediately), and again on every theme switch
+        (so an empty slot's placeholder swatch color tracks the new
+        theme's PANEL_BG instead of looking stale)."""
+        if not hasattr(self, "_profile_swatches"):
+            return
+        for i in range(1, 4):
+            parsed = theme.parse_custom_colors(self.db.get_setting(f"theme_profile_{i}", ""))
+            swatch = self._profile_swatches[i]
+            status = self._profile_status_labels[i]
+            load_btn = self._profile_load_buttons[i]
+            if parsed is None:
+                swatch.configure(bg=theme.PANEL_BG)
+                status.configure(text="(empty)")
+                load_btn.configure(state="disabled")
+            else:
+                bg, _fg, _accent = parsed
+                swatch.configure(bg=bg)
+                status.configure(text="saved")
+                load_btn.configure(state="normal")
+
+    def _apply_theme_to_live_widgets(self, colors: dict[str, str]) -> None:
+        """Re-applies a theme across the whole running app. The
+        ttk.Style update alone covers most of the UI live -- that's
+        the whole point of ttk styling, every widget using a given
+        style repaints itself automatically. A handful of plain tk
+        widgets set their colors explicitly at creation time instead
+        (the chat log, the moderation lists, the toolbar's popup
+        menus, the accent border frame around the notebook) and need
+        to be told again by hand."""
+        self.style = theme.apply_theme(self, colors)
+        self._apply_windows_titlebar_mode(self)
+        if hasattr(self, "_theme_border_frame"):
+            self._theme_border_frame.configure(bg=theme.ACCENT)
+        if hasattr(self, "_theme_inner_frame"):
+            self._theme_inner_frame.configure(bg=theme.BG)
+        # Settings/Themes tabs' scrolling Canvas -- a plain tk widget,
+        # so (like the chat log/listboxes/popup menus below) it needs
+        # telling about a new theme by hand rather than picking it up
+        # from ttk.Style automatically.
+        if hasattr(self, "_settings_canvas"):
+            self._settings_canvas.configure(bg=theme.BG)
+        if hasattr(self, "_themes_canvas"):
+            self._themes_canvas.configure(bg=theme.BG)
+        self._refresh_theme_profile_ui()
+        if hasattr(self, "chat_log"):
+            style_text_widget(self.chat_log)
+            self._configure_chat_log_tags()
+        if hasattr(self, "banned_listbox"):
+            style_listbox(self.banned_listbox)
+        if hasattr(self, "whitelist_listbox"):
+            style_listbox(self.whitelist_listbox)
+        if hasattr(self, "cred_menu"):
+            self.cred_menu.configure(**theme.popup_menu_kwargs())
+        if hasattr(self, "help_menu"):
+            self.help_menu.configure(**theme.popup_menu_kwargs())
+
+    # -- backup / restore -------------------------------------------------
+    def _backup_now(self) -> None:
+        default_name = f"lcbot-backup-{time.strftime('%Y%m%d-%H%M%S')}.lcbotbak"
+        dest = filedialog.asksaveasfilename(
+            title="Backup LCBot data", defaultextension=".lcbotbak",
+            filetypes=[("LCBot Backup", "*.lcbotbak")], initialfile=default_name,
+        )
+        if not dest:
+            return
+        try:
+            backup.create_backup(self.db.path, dest, __version__)
+        except Exception as exc:
+            messagebox.showerror("Backup", f"Backup failed: {exc}")
+            return
+        self._flash_saved(self.backup_status_label, "Backup created!")
+
+    def _restore_backup(self) -> None:
+        src = filedialog.askopenfilename(
+            title="Restore LCBot data",
+            filetypes=[("LCBot Backup", "*.lcbotbak"), ("All files", "*.*")],
+        )
+        if not src:
+            return
+        try:
+            manifest = backup.read_manifest(src)
+        except backup.InvalidBackupError as exc:
+            messagebox.showerror("Restore", str(exc))
+            return
+
+        created = manifest.get("created_at", "an unknown date")
+        confirmed = messagebox.askyesno(
+            "Restore",
+            f"This backup was created {created}.\n\n"
+            "Restoring will REPLACE your current commands, points, quotes, "
+            "timers, and settings with what's in this backup. Your current "
+            "data is saved as a .bak file first, just in case.\n\n"
+            "LCBot will close after restoring -- reopen it to see the "
+            "restored data. Continue?",
+        )
+        if not confirmed:
+            return
+
+        if self.bot.connected:
+            self.bot.disconnect()
+        db_path = self.db.path
+        self.db.close()
+        try:
+            backup.restore_backup(src, db_path)
+        except Exception as exc:
+            messagebox.showerror(
+                "Restore", f"Restore failed: {exc}\n\nPlease restart LCBot before continuing."
+            )
+            return
+        messagebox.showinfo(
+            "Restore", "Restore complete. LCBot will now close -- reopen it to see your restored data."
+        )
+        self.destroy()
+
+    def _export_portable_json(self) -> None:
+        default_name = f"lcbot-export-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        dest = filedialog.asksaveasfilename(
+            title="Export my data", defaultextension=".json",
+            filetypes=[("JSON", "*.json")], initialfile=default_name,
+        )
+        if not dest:
+            return
+        try:
+            backup.export_portable_json(self.db, dest)
+        except Exception as exc:
+            messagebox.showerror("Export", f"Export failed: {exc}")
+            return
+        self._flash_saved(self.backup_status_label, "Exported!")
 
     def _test_discord_webhook(self) -> None:
         url = self.settings_vars["discord_webhook_url"].get().strip()
@@ -1573,26 +2261,30 @@ class MainWindow(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _authorize_chat(self) -> None:
-        client_id = self.settings_vars["client_id"].get().strip()
+        client_id = oauth.effective_client_id(self.settings_vars["client_id"].get())
         if not client_id:
-            messagebox.showerror(
-                "Authorize",
-                "Please check your Client ID in Settings first (from your Twitch Dev "
-                "Console app).",
-            )
+            self._show_missing_client_id_error()
             return
         self._run_oauth(client_id, oauth.CHAT_SCOPES, "oauth_token", prefix="oauth:")
 
     def _authorize_helix(self) -> None:
-        client_id = self.settings_vars["client_id"].get().strip()
+        client_id = oauth.effective_client_id(self.settings_vars["client_id"].get())
         if not client_id:
-            messagebox.showerror(
-                "Authorize",
-                "Please check your Client ID in Settings first (from your Twitch Dev "
-                "Console app).",
-            )
+            self._show_missing_client_id_error()
             return
         self._run_oauth(client_id, oauth.HELIX_SCOPES, "helix_access_token", prefix="")
+
+    def _show_missing_client_id_error(self) -> None:
+        # Only reachable while oauth.LCBOT_CLIENT_ID is still blank
+        # (LCBot's shared app hasn't been registered/wired in yet) --
+        # once it is, "Log in with Twitch" always has a Client ID to
+        # use and this error can't fire any more.
+        messagebox.showerror(
+            "Log in with Twitch",
+            "Please enter a Client ID in Settings first (from your own Twitch Dev "
+            "Console app at dev.twitch.tv/console/apps) -- LCBot's built-in app isn't "
+            "set up yet, so this is needed for now.",
+        )
 
     def _run_oauth(self, client_id: str, scopes: list[str], target_field: str, prefix: str) -> None:
         def worker():
@@ -1632,7 +2324,13 @@ class MainWindow(tk.Tk):
         dialog = tk.Toplevel(self)
         dialog.title(title)
         dialog.geometry(geometry)
-        dialog.configure(bg="#1a1a1a")
+        dialog.configure(bg=theme.BG)
+        # Matches the main window's chrome: dark/light native titlebar
+        # per the current theme (the app icon is already inherited via
+        # _apply_app_icon's default= icon). Without this every popup
+        # showed Windows' plain white titlebar and stock feather icon
+        # regardless of theme.
+        self._apply_windows_titlebar_mode(dialog)
         return dialog
 
     def _flash_saved(self, label: ttk.Label, text: str = "Saved!", ms: int = 2500) -> None:
@@ -1704,6 +2402,13 @@ class MainWindow(tk.Tk):
                             "Didn't get signed in -- the browser sign-in either timed out or "
                             "was cancelled. Click the button again to retry.",
                         )
+                elif kind == "update_check_result":
+                    result, manual = payload
+                    if result:
+                        self._update_url = result["url"]
+                        self.update_label.configure(text=f"Update available: {result['version']} (click)")
+                    elif manual:
+                        messagebox.showinfo("Check for updates", f"You're up to date (v{__version__}).")
                 elif kind == "discord_test_result":
                     ok, err = payload
                     if ok:

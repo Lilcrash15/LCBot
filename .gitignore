@@ -3,6 +3,7 @@ chatbot.db
 chatbot.db-wal
 chatbot.db-shm
 song_overlay_state.json
+lcbot.log*
 __pycache__/
 *.pyc
 
