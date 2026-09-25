@@ -2119,7 +2119,7 @@ class PathsTests(unittest.TestCase):
 
     def test_app_dir_uses_executable_directory_when_frozen(self):
         with mock.patch.object(sys, "frozen", True, create=True), \
-                mock.patch.object(sys, "executable", "/fake/dist/TwitchChatBotV2.exe"):
+                mock.patch.object(sys, "executable", "/fake/dist/LCBot.exe"):
             self.assertEqual(paths.app_dir(), "/fake/dist")
 
 

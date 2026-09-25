@@ -4,7 +4,7 @@ directory when it was launched.
 
 For a plain `python run_bot.py` run, `app_dir()` is the same as
 `os.getcwd()` almost all of the time, so nothing changes there. It
-matters for the compiled exe: double-clicking TwitchChatBotV2.exe
+matters for the compiled exe: double-clicking LCBot.exe
 directly inside its own folder in Explorer sets the working directory
 to that folder, but that's not guaranteed -- a desktop shortcut with
 its own "Start in" field (blank or pointing elsewhere), launching via

@@ -5,6 +5,22 @@ All notable changes to LCBot are logged here. Versions follow
 
 ## [Unreleased]
 
+### Changed
+- **The built exe is now `LCBot.exe`, renamed from `TwitchChatBotV2.exe`.**
+  Ryan noticed the exe said "V2" while the actual release tag was
+  `v1.0.0` and asked to make those match. The "V2" was never a version
+  number -- it was an internal build name from when this exe first
+  replaced an even older `TwitchChatBot.exe` build, kept stable back
+  then purely so a rebuild's output filename wouldn't collide with a
+  copy still running/locked from a previous test. That collision risk
+  is gone now (different filename entirely), and keeping "V2" around
+  was just confusing next to a real `v1.0.0` release tag, so the exe
+  now simply matches the app's real name and version everywhere: the
+  title bar, the About dialog, and the Releases page all say "LCBot".
+  Existing `config.json`/`chatbot.db` files aren't affected -- LCBot
+  finds its own data next to wherever it's actually running from,
+  regardless of what the exe is named.
+
 ## [1.0.0] - 2026-09-25
 
 ### Changed

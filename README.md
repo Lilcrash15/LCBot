@@ -149,7 +149,7 @@ requires editing files by hand.
 
 ### 1. Download and run
 
-Grab `TwitchChatBotV2.exe` from the [Releases](../../releases) page
+Grab `LCBot.exe` from the [Releases](../../releases) page
 (newest version at the top) and run it -- no Python install needed,
 nothing else to set up first. The first time it runs it creates a
 blank `config.json` (connection settings) and `chatbot.db` (everything
@@ -293,7 +293,7 @@ which folder Windows happened to launch it from (a desktop shortcut,
 Task Scheduler, etc.). If you ever see LCBot behaving as if it's
 missing its settings/data (or its taskbar icon looks like Tk's stock
 feather icon instead of LCBot's own), check that these files are
-actually sitting in the same folder as `TwitchChatBotV2.exe` -- if
+actually sitting in the same folder as `LCBot.exe` -- if
 they're not, something is launching the exe in an unusual way.
 
 ## Testing
@@ -378,7 +378,7 @@ tests/
                      Python, which always has it -- just never opens a
                      window)
 run_bot.py           entry point
-build_exe.bat        PyInstaller build script -> dist\TwitchChatBotV2.exe
+build_exe.bat        PyInstaller build script -> dist\LCBot.exe
 build_and_release.bat one-click: bump version, build, commit/push, tag, and publish a release
 _ship_helpers.py      Python helper build_and_release.bat calls for version-number/CHANGELOG edits
 setup_github.bat      one-time: creates the GitHub repo and pushes
@@ -405,7 +405,7 @@ get from a plain text command.
 
 Tagged versions and their change notes live in
 [`CHANGELOG.md`](CHANGELOG.md). Each tagged release on the
-[Releases](../../releases) page has the matching `TwitchChatBotV2.exe`
+[Releases](../../releases) page has the matching `LCBot.exe`
 attached, built the same way `build_exe.bat` builds it locally --
 grab that if you just want to run the bot without installing Python
 or building it yourself. Versions are always plain `MAJOR.MINOR.PATCH`

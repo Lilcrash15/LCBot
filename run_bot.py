@@ -54,7 +54,7 @@ def _set_windows_app_id() -> None:
     actually say whether this call even worked."""
     if not sys.platform.startswith("win"):
         return
-    app_id = "LCBot.TwitchChatBotV2"
+    app_id = "LCBot.LCBot"
     try:
         import ctypes
         hresult = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
