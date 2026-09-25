@@ -5,6 +5,8 @@ All notable changes to LCBot are logged here. Versions follow
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-25
+
 ### Changed
 - **Window title and About dialog renamed from the generic "Twitch
   Chat Bot" to "LCBot"** -- matching the name already used everywhere
