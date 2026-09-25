@@ -1,9 +1,17 @@
 """Chat filters: links, excessive caps, symbol spam, banned phrases, and
 message repetition -- with an escalating strikes -> timeout response.
 Mods and the broadcaster are always exempt. This module only decides
-*what* to do; the actual delete/timeout/ban is issued as an IRC
-PRIVMSG chat command (/timeout, /delete, /ban), which is how Twitch
-chat moderation has always worked over IRC.
+*what* to do; the actual delete/timeout/ban is issued via the Twitch
+Helix Moderation API by Bot._apply_moderation (core/bot.py) -- Twitch
+retired /timeout, /delete, /ban as IRC chat commands, so they can no
+longer be sent as plain PRIVMSG chat messages the way they used to be.
+
+A moderator can also temporarily lift every filter for one specific
+user via !permit (see ModerationModule.permit() / the !permit builtin
+command in core/bot.py) -- e.g. a raid host or clip link that would
+otherwise get caught by the link/caps/spam filters. It's a one-shot
+exemption: it covers exactly that user's next message, and expires on
+its own after moderation_permit_seconds even if they never send one.
 """
 from __future__ import annotations
 
@@ -33,14 +41,39 @@ class ModerationAction:
 class ModerationModule:
     def __init__(self, db):
         self.db = db
+        self._permitted_until: dict[str, float] = {}
 
     def _exempt(self, message: ChatMessage) -> bool:
         return message.is_mod or message.is_broadcaster
+
+    def permit(self, username: str, seconds: Optional[int] = None) -> int:
+        """Exempts `username`'s very next message from every moderation
+        filter (links, banned phrases, caps, symbol spam, repetition) --
+        used by the !permit <username> mod command. The exemption is
+        one-shot (cleared the moment their next message is checked, so
+        it doesn't linger) and also expires on its own after `seconds`
+        (moderation_permit_seconds by default) if they never send one,
+        so re-running !permit on someone who left doesn't leave a
+        standing hole in moderation. Returns the number of seconds the
+        exemption is good for, for the caller to report back in chat."""
+        window = seconds if seconds is not None else self.db.get_setting_int("moderation_permit_seconds", 60)
+        self._permitted_until[username.lower()] = time.time() + window
+        return window
+
+    def _consume_permit(self, username: str) -> bool:
+        key = username.lower()
+        expires_at = self._permitted_until.pop(key, None)
+        if expires_at is None:
+            return False
+        return time.time() <= expires_at
 
     def check_message(self, message: ChatMessage) -> Optional[ModerationAction]:
         if not self.db.get_setting_bool("moderation_enabled", True):
             return None
         if self._exempt(message):
+            _LAST_MESSAGE_BY_USER[message.username] = message.text
+            return None
+        if self._consume_permit(message.username):
             _LAST_MESSAGE_BY_USER[message.username] = message.text
             return None
 

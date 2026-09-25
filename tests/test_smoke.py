@@ -7,6 +7,9 @@ moderation filters, and IRC tag parsing). Run with:
 Nothing here touches Twitch or YouTube -- it's here to catch regressions
 in the plumbing, not to validate live behavior.
 """
+import ctypes
+import io
+import json
 import os
 import random
 import shutil
@@ -14,11 +17,13 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import run_bot
 from chatbot.core import backup, oauth, overlay_server, paths, update_check
 from chatbot.core.bot import Bot
 from chatbot.core.config import ConfigStore
@@ -26,10 +31,13 @@ from chatbot.core.database import Database
 from chatbot.core.friendly_errors import friendly_error_text
 from chatbot.core.irc_client import ChatMessage, TwitchIRCClient, _parse_tags
 from chatbot.gui import theme
+from chatbot.gui.emote_cache import EmoteBadgeCache
+from chatbot.gui.main_window import _needs_emoji_font
 from chatbot.modules.alerts import AlertsModule
 from chatbot.modules.boss_battle import BossBattleModule, BossState
 from chatbot.modules.commands import CommandContext, CommandEngine, default_variable_resolver
 from chatbot.modules.currency import CurrencyModule
+from chatbot.modules import discord_notify
 from chatbot.modules.discord_notify import DiscordNotifier
 from chatbot.modules.event_system import EventSystemModule
 from chatbot.modules.game_queue import GameQueueModule
@@ -38,7 +46,7 @@ from chatbot.modules.heist import HeistModule, HeistState
 from chatbot.modules.moderation import ModerationModule
 from chatbot.modules.songrequests import SongRequestsModule
 from chatbot.modules.streaminfo import StreamInfoModule
-from chatbot.modules.twitch_api import StreamInfo, TwitchAPIError
+from chatbot.modules.twitch_api import StreamInfo, TwitchAPI, TwitchAPIError
 from chatbot.modules.youtube_api import extract_video_id, parse_iso8601_duration
 
 
@@ -263,6 +271,43 @@ class ModerationTests(unittest.TestCase):
         second = self.mod.check_message(msg2)
         self.assertGreater(second.timeout_seconds, 0)
 
+    def test_permit_exempts_next_message_from_every_filter(self):
+        self.mod.permit("linkuser")
+        msg = make_message(username="linkuser", text="CHECK OUT HTTP://SPAM.COM!!!! aaaaaaaaaaaaaaaaaaaa")
+        self.assertIsNone(self.mod.check_message(msg))
+
+    def test_permit_is_case_insensitive(self):
+        self.mod.permit("LinkUser")
+        msg = make_message(username="linkuser", text="check example.com/free-stuff")
+        self.assertIsNone(self.mod.check_message(msg))
+
+    def test_permit_only_covers_one_message(self):
+        self.mod.permit("linkuser")
+        first = make_message(username="linkuser", text="check example.com/free-stuff")
+        self.assertIsNone(self.mod.check_message(first))
+        second = make_message(username="linkuser", text="another one example.org/more-stuff")
+        action = self.mod.check_message(second)
+        self.assertIsNotNone(action)
+        self.assertIn("link", action.reason)
+
+    def test_permit_expires_after_its_window(self):
+        self.mod.permit("linkuser", seconds=-1)  # already expired
+        msg = make_message(username="linkuser", text="check example.com/free-stuff")
+        action = self.mod.check_message(msg)
+        self.assertIsNotNone(action)
+        self.assertIn("link", action.reason)
+
+    def test_permit_uses_configured_default_window(self):
+        self.db.set_setting("moderation_permit_seconds", 30)
+        seconds = self.mod.permit("linkuser")
+        self.assertEqual(seconds, 30)
+
+    def test_permit_does_not_exempt_mods_check_or_others(self):
+        self.mod.permit("linkuser")
+        other = make_message(username="someoneelse", text="check example.com/free-stuff")
+        action = self.mod.check_message(other)
+        self.assertIsNotNone(action)
+
 
 class IRCParsingTests(unittest.TestCase):
     def test_parse_tags_unescapes_values(self):
@@ -290,6 +335,138 @@ class YouTubeHelpersTests(unittest.TestCase):
         self.assertEqual(parse_iso8601_duration("PT3M33S"), 213)
         self.assertEqual(parse_iso8601_duration("PT1H2M3S"), 3723)
         self.assertEqual(parse_iso8601_duration("PT45S"), 45)
+
+
+class FakeBadgeAPI:
+    def __init__(self, global_badges=None, channel_badges=None, user_id="123", fail=False):
+        self.global_badges = global_badges if global_badges is not None else {"data": []}
+        self.channel_badges = channel_badges if channel_badges is not None else {"data": []}
+        self.user_id = user_id
+        self.fail = fail
+        self.global_calls = 0
+        self.channel_calls = 0
+
+    def get_global_badges(self):
+        self.global_calls += 1
+        if self.fail:
+            raise RuntimeError("network down")
+        return self.global_badges
+
+    def get_channel_badges(self, broadcaster_id):
+        self.channel_calls += 1
+        return self.channel_badges
+
+    def get_user_id(self, login):
+        return self.user_id
+
+
+class EmoteBadgeCacheTests(unittest.TestCase):
+    """Regression coverage from investigating a report of a chat badge
+    (WizeBot's) showing up missing in the Console tab -- found a real
+    bug along the way: _ensure_badges_loaded used to mark badges as
+    "loaded" *before* actually fetching them, so a single transient
+    Twitch API failure permanently blanked out every badge for the
+    rest of that run with no retry. _read_or_download/_to_photoimage
+    are stubbed out in these tests since they're just network I/O and
+    Tk image decoding -- what's under test here is the loading/caching
+    logic itself, not either of those."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _make_cache(self, api, broadcaster_login="testchan"):
+        cache = EmoteBadgeCache(
+            cache_dir=os.path.join(self.tmpdir, f"cache_{id(api)}"),
+            get_twitch_api=lambda: api,
+            get_broadcaster_login=lambda: broadcaster_login,
+        )
+        cache._read_or_download = lambda path, url: b"fake-image-bytes"
+        cache._to_photoimage = lambda data: ("photoimage", data) if data else None
+        return cache
+
+    def test_no_api_yet_returns_none_without_marking_loaded(self):
+        cache = self._make_cache(None)
+        self.assertIsNone(cache.get_badge_image("moderator", "1"))
+        self.assertFalse(cache._badges_loaded)
+
+    def test_global_badge_loads_successfully(self):
+        api = FakeBadgeAPI(global_badges={
+            "data": [{"set_id": "moderator", "versions": [{"id": "1", "image_url_1x": "http://x/mod.png"}]}]
+        })
+        cache = self._make_cache(api)
+        image = cache.get_badge_image("moderator", "1")
+        self.assertIsNotNone(image)
+
+    def test_unknown_badge_returns_none(self):
+        api = FakeBadgeAPI()
+        cache = self._make_cache(api)
+        self.assertIsNone(cache.get_badge_image("nonexistent", "1"))
+
+    def test_channel_badges_are_indexed_when_broadcaster_resolves(self):
+        api = FakeBadgeAPI(
+            channel_badges={"data": [{"set_id": "subscriber", "versions": [{"id": "3", "image_url_1x": "http://x/sub.png"}]}]},
+        )
+        cache = self._make_cache(api)
+        image = cache.get_badge_image("subscriber", "3")
+        self.assertIsNotNone(image)
+        self.assertEqual(api.channel_calls, 1)
+
+    def test_failed_fetch_does_not_permanently_block_future_lookups(self):
+        api = FakeBadgeAPI(fail=True)
+        cache = self._make_cache(api)
+        self.assertIsNone(cache.get_badge_image("moderator", "1"))
+        self.assertEqual(api.global_calls, 1)
+        self.assertFalse(cache._badges_loaded)
+
+        # Twitch recovers -- the very next lookup should retry rather
+        # than staying latched as "already tried, nothing there."
+        api.fail = False
+        api.global_badges = {"data": [{"set_id": "moderator", "versions": [{"id": "1", "image_url_1x": "http://x/mod.png"}]}]}
+        image = cache.get_badge_image("moderator", "1")
+        self.assertIsNotNone(image)
+        self.assertEqual(api.global_calls, 2)
+
+    def test_reset_forces_a_fresh_reload_on_next_lookup(self):
+        api = FakeBadgeAPI(global_badges={
+            "data": [{"set_id": "moderator", "versions": [{"id": "1", "image_url_1x": "http://x/mod.png"}]}]
+        })
+        cache = self._make_cache(api)
+        cache.get_badge_image("moderator", "1")
+        self.assertEqual(api.global_calls, 1)
+        cache.reset()
+        cache.get_badge_image("moderator", "1")
+        self.assertEqual(api.global_calls, 2)
+
+
+class EmojiFallbackTests(unittest.TestCase):
+    """_needs_emoji_font is the pure logic behind _insert_with_emoji_
+    fallback (main_window.py) -- see that function's docstring for the
+    2026-09-09 report this fixes (WizeBot's own status messages showing
+    tofu boxes for some of its symbol characters). Everything past this
+    point (actually splitting/tagging runs in the Text widget) needs a
+    real Tk window and is headless-Xvfb-verified instead, same as the
+    rest of the GUI."""
+
+    def test_reported_characters_need_the_emoji_font(self):
+        # The two characters from Ryan's actual screenshot.
+        self.assertTrue(_needs_emoji_font("❗"))  # ❗ heavy exclamation mark
+        self.assertTrue(_needs_emoji_font("❌"))  # ❌ cross mark
+
+    def test_common_emoji_need_the_emoji_font(self):
+        self.assertTrue(_needs_emoji_font("\U0001F600"))  # 😀 emoticon block
+        self.assertTrue(_needs_emoji_font("\U0001F1FA"))  # 🇺 regional indicator (flags)
+        self.assertTrue(_needs_emoji_font("⭐"))       # ⭐ misc symbols and arrows
+        self.assertTrue(_needs_emoji_font("️"))       # emoji variation selector
+        self.assertTrue(_needs_emoji_font("⃣"))       # combining keycap
+
+    def test_ordinary_chat_text_does_not_need_the_emoji_font(self):
+        for ch in "Twitch chat 123!?,.'\"-":
+            self.assertFalse(_needs_emoji_font(ch), f"{ch!r} shouldn't need the emoji font")
+        # Smart quotes/dashes/ellipsis: real punctuation Segoe UI itself
+        # covers fine -- these should NOT get shunted into the emoji
+        # font just for being outside plain ASCII.
+        for ch in "‘’“”–—…":
+            self.assertFalse(_needs_emoji_font(ch), f"{ch!r} shouldn't need the emoji font")
 
 
 class GiveawayTests(unittest.TestCase):
@@ -416,6 +593,56 @@ class IRCClientBehaviorTests(unittest.TestCase):
         self.assertEqual(len(joined_statuses), 1)
 
 
+class IRCReconnectTests(unittest.TestCase):
+    """Regression coverage for a real, confirmed live bug (2026-09-25):
+    Ryan reported the bot disconnecting during long streams and needing
+    a manual Connect click every time. Root-caused via his own
+    lcbot.log (no errors at all logged around the drop -- the app just
+    silently thought it was still connected) plus Twitch's own IRC docs,
+    which document both a RECONNECT command sent for server-side
+    maintenance ("an indeterminate" time before it actually disconnects)
+    and, per real-world reports, a roughly-5-minute PING cadence that a
+    plain recv()-timeout loop can't tell apart from a dead connection on
+    its own. These tests cover the parts reachable without a real
+    socket -- see _read_loop/_attempt_auto_reconnect in irc_client.py
+    for the full fix, which needed Ryan's real PC to confirm live."""
+
+    def setUp(self):
+        self.statuses = []
+        self.client = TwitchIRCClient(
+            on_message=lambda m: None,
+            on_status=lambda s: self.statuses.append(s),
+        )
+        self.client._our_nick = "mybot"
+        self.client._channel = "testchan"
+
+    def test_reconnect_command_sets_the_flag_read_loop_watches_for(self):
+        self.client._handle_line(":tmi.twitch.tv RECONNECT")
+        self.assertTrue(self.client._reconnect_requested)
+
+    def test_reconnect_command_does_not_itself_announce_a_disconnect(self):
+        # RECONNECT is just a flag for _read_loop to notice and act on
+        # on its own schedule -- handling it shouldn't fire any status
+        # line on its own (a real "Disconnected"/"Reconnected..." only
+        # ever comes from _read_loop/_attempt_auto_reconnect actually
+        # tearing down and re-establishing the socket).
+        self.client._handle_line(":tmi.twitch.tv RECONNECT")
+        self.assertEqual(self.statuses, [])
+
+    def test_a_privmsg_that_merely_mentions_reconnect_does_not_trigger_it(self):
+        self.client._handle_line(
+            ":viewer1!viewer1@viewer1.tmi.twitch.tv PRIVMSG #testchan :you should reconnect the bot"
+        )
+        self.assertFalse(self.client._reconnect_requested)
+
+    def test_attempt_auto_reconnect_abandons_immediately_once_already_stopping(self):
+        # If disconnect() has already run (stop_event set) by the time
+        # _read_loop gets around to retrying, there should be no retry
+        # at all -- a deliberate disconnect always wins.
+        self.client._stop_event.set()
+        self.assertFalse(self.client._attempt_auto_reconnect())
+
+
 class FakeTwitchAPI:
     """Stands in for TwitchAPI in Bot tests -- records what would have
     been sent via Helix instead of making a real network call."""
@@ -428,6 +655,9 @@ class FakeTwitchAPI:
         }
         self.user_id = user_id
         self.modify_calls = []
+        self.ban_calls = []
+        self.unban_calls = []
+        self.delete_calls = []
 
     def get_user_id(self, login):
         return self.user_id
@@ -443,6 +673,15 @@ class FakeTwitchAPI:
 
     def modify_channel_info(self, broadcaster_id, title=None, game_id=None):
         self.modify_calls.append((broadcaster_id, title, game_id))
+
+    def ban_user(self, broadcaster_id, moderator_id, user_id, duration=None, reason=""):
+        self.ban_calls.append((broadcaster_id, moderator_id, user_id, duration, reason))
+
+    def unban_user(self, broadcaster_id, moderator_id, user_id):
+        self.unban_calls.append((broadcaster_id, moderator_id, user_id))
+
+    def delete_chat_message(self, broadcaster_id, moderator_id, message_id):
+        self.delete_calls.append((broadcaster_id, moderator_id, message_id))
 
 
 class BotOutgoingIdentityTests(unittest.TestCase):
@@ -486,6 +725,43 @@ class BotOutgoingIdentityTests(unittest.TestCase):
         self.bot.send_chat_as_broadcaster("!cc")
         self.assertEqual(self.fake_api.sent, [("12345", "12345", "!cc")])
         self.assertEqual(self.outgoing, [])
+
+
+class BotPermitCommandTests(unittest.TestCase):
+    """!permit username (mod-only) wires CommandEngine.handle through to
+    ModerationModule.permit() -- covers the actual chat-command path,
+    not just the module method in isolation (see ModerationTests)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        config = ConfigStore(os.path.join(self.tmpdir, "config.json"))
+        db = Database(os.path.join(self.tmpdir, "chatbot.db"))
+        self.bot = Bot(config, db)
+
+    def test_permit_from_a_mod_exempts_the_named_user(self):
+        mod_msg = make_message(username="modperson", text="!permit linkuser", mod=True)
+        reply = self.bot.engine.handle(mod_msg, self.bot)
+        self.assertIn("linkuser", reply.lower())
+        exempted = make_message(username="linkuser", text="check example.com/free-stuff")
+        self.assertIsNone(self.bot.moderation.check_message(exempted))
+
+    def test_permit_strips_leading_at_sign_and_lowercases(self):
+        mod_msg = make_message(username="modperson", text="!permit @LinkUser", mod=True)
+        self.bot.engine.handle(mod_msg, self.bot)
+        exempted = make_message(username="linkuser", text="check example.com/free-stuff")
+        self.assertIsNone(self.bot.moderation.check_message(exempted))
+
+    def test_permit_from_a_regular_viewer_is_rejected(self):
+        viewer_msg = make_message(username="regular", text="!permit linkuser", mod=False)
+        reply = self.bot.engine.handle(viewer_msg, self.bot)
+        self.assertIsNone(reply)
+        still_flagged = make_message(username="linkuser", text="check example.com/free-stuff")
+        self.assertIsNotNone(self.bot.moderation.check_message(still_flagged))
+
+    def test_permit_without_a_username_reports_usage(self):
+        mod_msg = make_message(username="modperson", text="!permit", mod=True)
+        reply = self.bot.engine.handle(mod_msg, self.bot)
+        self.assertIn("usage", reply.lower())
 
 
 class BotStreamInfoTests(unittest.TestCase):
@@ -534,6 +810,23 @@ class BotStreamInfoTests(unittest.TestCase):
         self.bot.twitch_api = FailingAPI()
         self.bot._refresh_stream_info()
         self.assertEqual(self.bot.last_stream_info.viewer_count, 12)
+
+    def test_refresh_stream_info_sends_chat_alert_on_title_change(self):
+        """_refresh_stream_info feeds each snapshot to
+        AlertsModule.check_stream_info and sends whatever comes back --
+        this is what actually announces a title/game change in chat
+        (see AlertsTitleGameChangeTests for the diffing logic itself)."""
+        sent = []
+        self.bot.irc.send_message = lambda text: sent.append(text)
+
+        self.bot.twitch_api = FakeTwitchAPI(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        self.bot._refresh_stream_info()  # establishes the baseline, no announce
+        self.assertEqual(sent, [])
+
+        self.bot.twitch_api = FakeTwitchAPI(StreamInfo(live=True, title="New title!", game_name="Just Chatting"))
+        self.bot._refresh_stream_info()
+        self.assertEqual(len(sent), 1)
+        self.assertIn("New title!", sent[0])
 
 
 class BotUpdateStreamInfoTests(unittest.TestCase):
@@ -614,6 +907,197 @@ class BotUpdateStreamInfoTests(unittest.TestCase):
             self.bot.update_stream_info(title="x")
 
 
+class BotModerationHelixTests(unittest.TestCase):
+    """Regression coverage for the Twitch moderation fix: /timeout,
+    /ban, /delete, and /unban stopped working as IRC chat commands
+    (Twitch now replies "Unrecognized command: ..." for all of them),
+    so Bot.timeout_user/ban_user/unban_user/delete_message now go
+    through the Helix Moderation API instead, using the *bot*
+    account's own token/user id (self.mod_api / cfg.bot_username) --
+    not the streamer's -- since Twitch requires moderator_id to match
+    the token's owner and the bot is the one that's actually modded."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.config = ConfigStore(os.path.join(self.tmpdir, "config.json"))
+        self.config.data.channel = "testchan"
+        self.config.data.bot_username = "lilcrashbot"
+        db = Database(os.path.join(self.tmpdir, "chatbot.db"))
+        self.bot = Bot(self.config, db)
+        self.fake_api = FakeTwitchAPI(user_id="55555")
+        self.bot.mod_api = self.fake_api
+
+    def test_mod_ids_resolves_broadcaster_and_bot_ids(self):
+        self.assertEqual(self.bot._mod_ids(), ("55555", "55555"))
+
+    def test_mod_ids_none_without_mod_api(self):
+        self.bot.mod_api = None
+        self.assertIsNone(self.bot._mod_ids())
+
+    def test_mod_ids_none_without_channel(self):
+        self.bot.config.data.channel = ""
+        self.assertIsNone(self.bot._mod_ids())
+
+    def test_mod_ids_none_without_bot_username(self):
+        self.bot.config.data.bot_username = ""
+        self.assertIsNone(self.bot._mod_ids())
+
+    def test_ban_user_calls_helix_with_no_duration(self):
+        ok = self.bot.ban_user("baduser", reason="spam")
+        self.assertTrue(ok)
+        self.assertEqual(self.fake_api.ban_calls, [("55555", "55555", "55555", None, "spam")])
+
+    def test_timeout_user_calls_helix_with_duration(self):
+        ok = self.bot.timeout_user("baduser", 600, reason="caps")
+        self.assertTrue(ok)
+        self.assertEqual(self.fake_api.ban_calls, [("55555", "55555", "55555", 600, "caps")])
+
+    def test_unban_user_calls_helix(self):
+        ok = self.bot.unban_user("gooduser")
+        self.assertTrue(ok)
+        self.assertEqual(self.fake_api.unban_calls, [("55555", "55555", "55555")])
+
+    def test_delete_message_calls_helix(self):
+        ok = self.bot.delete_message("msg-uuid-123")
+        self.assertTrue(ok)
+        self.assertEqual(self.fake_api.delete_calls, [("55555", "55555", "msg-uuid-123")])
+
+    def test_ban_user_returns_false_without_mod_api(self):
+        self.bot.mod_api = None
+        self.assertFalse(self.bot.ban_user("baduser"))
+
+    def test_ban_user_returns_false_when_user_id_unresolved(self):
+        class UnresolvableAPI(FakeTwitchAPI):
+            def get_user_id(self, login):
+                return None if login == "baduser" else "55555"
+
+        self.bot.mod_api = UnresolvableAPI()
+        self.assertFalse(self.bot.ban_user("baduser"))
+
+    def test_ban_user_swallows_api_errors(self):
+        class FailingAPI(FakeTwitchAPI):
+            def ban_user(self, *a, **kw):
+                raise TwitchAPIError("Twitch is down")
+
+        self.bot.mod_api = FailingAPI(user_id="55555")
+        self.assertFalse(self.bot.ban_user("baduser"))
+
+    def test_apply_moderation_deletes_and_times_out_via_helix_not_send_chat(self):
+        sent = []
+        self.bot.send_chat = lambda text: sent.append(text)
+        message = make_message(username="baduser", text="spam")
+        message.message_id = "abc-123"
+
+        class Action:
+            delete = True
+            ban = False
+            timeout_seconds = 300
+            reason = "banned phrase"
+            warn_message = "@baduser watch it"
+
+        self.bot._apply_moderation(message, Action())
+        self.assertEqual(self.fake_api.delete_calls, [("55555", "55555", "abc-123")])
+        self.assertEqual(self.fake_api.ban_calls, [("55555", "55555", "55555", 300, "banned phrase")])
+        # Only the warn message still goes over chat -- delete/timeout no
+        # longer do (that's the whole point of this fix).
+        self.assertEqual(sent, ["@baduser watch it"])
+
+    def test_apply_moderation_ban_takes_priority_over_timeout(self):
+        message = make_message(username="baduser", text="spam")
+
+        class Action:
+            delete = False
+            ban = True
+            timeout_seconds = 300
+            reason = "banned"
+            warn_message = None
+
+        self.bot._apply_moderation(message, Action())
+        self.assertEqual(self.fake_api.ban_calls, [("55555", "55555", "55555", None, "banned")])
+
+
+class TwitchAPIModerationTests(unittest.TestCase):
+    """Direct coverage of TwitchAPI's Helix moderation methods -- the
+    actual HTTP calls that replaced the old /ban, /timeout, /unban,
+    /delete IRC chat commands after Twitch retired them. No real
+    network: urlopen is mocked and the Request object it was handed
+    is inspected instead."""
+
+    def _mock_response(self):
+        cm = mock.MagicMock()
+        cm.__enter__.return_value.read.return_value = b"{}"
+        cm.__exit__.return_value = False
+        return cm
+
+    def setUp(self):
+        self.api = TwitchAPI("client123", "oauth:tok456")
+
+    def test_ban_user_posts_to_bans_endpoint_without_duration(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=10):
+            captured["req"] = req
+            return self._mock_response()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.api.ban_user("111", "222", "333", reason="spam")
+        req = captured["req"]
+        self.assertIn("/moderation/bans?broadcaster_id=111&moderator_id=222", req.full_url)
+        self.assertEqual(req.get_method(), "POST")
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(body, {"data": {"user_id": "333", "reason": "spam"}})
+        self.assertEqual(req.get_header("Authorization"), "Bearer tok456")
+
+    def test_ban_user_includes_duration_for_timeout(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=10):
+            captured["req"] = req
+            return self._mock_response()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.api.ban_user("111", "222", "333", duration=600)
+        body = json.loads(captured["req"].data.decode("utf-8"))
+        self.assertEqual(body["data"]["duration"], 600)
+        self.assertNotIn("reason", body["data"])
+
+    def test_ban_user_raises_friendly_error_on_http_error(self):
+        def raise_http_error(req, timeout=10):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(b"missing scope"))
+
+        with mock.patch("urllib.request.urlopen", side_effect=raise_http_error):
+            with self.assertRaises(TwitchAPIError):
+                self.api.ban_user("111", "222", "333")
+
+    def test_unban_user_sends_delete_to_bans_endpoint(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=10):
+            captured["req"] = req
+            return self._mock_response()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.api.unban_user("111", "222", "333")
+        req = captured["req"]
+        self.assertEqual(req.get_method(), "DELETE")
+        self.assertIn("/moderation/bans?", req.full_url)
+        self.assertIn("user_id=333", req.full_url)
+
+    def test_delete_chat_message_sends_delete_to_chat_endpoint(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=10):
+            captured["req"] = req
+            return self._mock_response()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            self.api.delete_chat_message("111", "222", "msg-uuid")
+        req = captured["req"]
+        self.assertEqual(req.get_method(), "DELETE")
+        self.assertIn("/moderation/chat?", req.full_url)
+        self.assertIn("message_id=msg-uuid", req.full_url)
+
+
 class FriendlyErrorTests(unittest.TestCase):
     """friendly_error_text() is what turns a raw TwitchAPIError/
     Discord-webhook RuntimeError/network exception into the plain-
@@ -684,35 +1168,126 @@ class FakeStreamInfoTwitchAPI:
 
 
 class DiscordNotifierTests(unittest.TestCase):
-    """Regression coverage for the Discord "went live" webhook: it
-    should announce only on an actual offline -> live transition, never
-    on the first check after a (re)connect (that just establishes a
-    baseline -- otherwise reopening the bot while already live would
-    fire a false announcement), and it should respect the
-    enabled/webhook_url/channel guards and the check interval."""
+    """Regression coverage for the Discord "went live" webhook.
+
+    Redesigned 2026-09-25 after Ryan explained why the "only announce
+    on an actual offline -> live transition" rule (the original
+    design, meant to avoid a false announcement on every reconnect)
+    was actually wrong for how he streams: "a lot of programs I have
+    to open when I stream" means the bot is often opened AFTER the
+    stream already started, and he wants the announcement to still go
+    out in that case. The fix identifies a broadcast by Twitch's own
+    started_at timestamp and persists "have I announced this one yet"
+    to the database (LAST_ANNOUNCED_STREAM_SETTING_KEY) instead of
+    keeping it only in memory -- so it correctly announces exactly
+    once per real broadcast, whether the bot catches the offline ->
+    live transition live, connects after the stream already started,
+    or reconnects/restarts mid-stream for any reason (auto-reconnect,
+    a manual reconnect, closing and reopening the whole app)."""
 
     def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db = Database(os.path.join(self.tmpdir, "chatbot.db"))
         self.sent = []
-        self.notifier = DiscordNotifier(sender=lambda url, text: self.sent.append((url, text)))
+        self.notifier = DiscordNotifier(self.db, sender=lambda url, text: self.sent.append((url, text)))
 
-    def test_first_tick_establishes_baseline_without_announcing(self):
-        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+    def test_already_live_with_known_start_time_announces_immediately(self):
+        """The actual behavior Ryan asked for: connecting (or
+        reconnecting) while the stream is already live sends the
+        announcement right away, as long as this exact broadcast
+        hasn't been announced yet."""
+        api = FakeStreamInfoTwitchAPI(
+            StreamInfo(live=True, title="Hello", game_name="Just Chatting", started_at=5000.0)
+        )
         self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
+        self.assertEqual(self.sent, [("https://discord.example/webhook", "testchan is live")])
+        self.assertAlmostEqual(
+            self.db.get_setting_float(discord_notify.LAST_ANNOUNCED_STREAM_SETTING_KEY), 5000.0
+        )
+
+    def test_already_live_with_unannounced_broadcast_is_logged(self):
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, title="Hello", game_name="Just Chatting", started_at=5000.0))
+        with self.assertLogs("chatbot.discord", level="INFO") as cm:
+            self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
+        self.assertTrue(any("hasn't been announced yet for this broadcast" in line for line in cm.output))
+
+    def test_reconnecting_mid_same_broadcast_does_not_reannounce(self):
+        """The other half of the redesign: a reconnect (simulated here
+        via reset(), same as Bot.connect() calls on every (re)connect)
+        during the SAME broadcast must not re-send -- the persisted
+        key is exactly what makes this survive reset(), unlike the old
+        in-memory-only baseline."""
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, started_at=5000.0))
+        self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
+        self.assertEqual(len(self.sent), 1)
+        self.notifier.reset()
+        self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1061.0)
+        self.assertEqual(len(self.sent), 1)  # still just the one -- no second send
+
+    def test_new_broadcast_after_a_previous_one_announces_again(self):
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, started_at=5000.0))
+        self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
+        self.assertEqual(len(self.sent), 1)
+        # A later, genuinely different broadcast (new started_at) --
+        # e.g. the stream ended and a new one started hours later.
+        api.info = StreamInfo(live=True, started_at=99999.0)
+        self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1061.0)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_record_announced_broadcast_prevents_a_later_automatic_duplicate(self):
+        """Covers the manual "Send now" backup button's use of this
+        method directly (main_window.py calls it after a successful
+        manual send, outside of tick() entirely) -- confirms marking a
+        broadcast as announced this way is indistinguishable, from
+        tick()'s point of view, from tick() having sent it itself."""
+        self.notifier.record_announced_broadcast(5000.0)
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, started_at=5000.0))
+        self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
+        self.assertEqual(self.sent, [])  # tick() sees it as already-announced, doesn't duplicate
+
+    def test_record_announced_broadcast_is_a_safe_noop_without_a_started_at(self):
+        # The manual button falls back to a blank StreamInfo(live=True)
+        # (started_at=None) when it can't fetch real Twitch data --
+        # this must not raise or write anything nonsensical to the db.
+        self.notifier.record_announced_broadcast(None)
+        self.assertIsNone(self.db.get_setting(discord_notify.LAST_ANNOUNCED_STREAM_SETTING_KEY))
+
+    def test_no_started_at_falls_back_to_transition_only_baseline(self):
+        """The rare case (a malformed started_at from Twitch -- see
+        TwitchAPI.get_stream_info) where there's no real per-broadcast
+        key to dedup against at all: falls back to the original
+        "don't announce on the very first check" behavior so it at
+        least doesn't re-announce on every single 60s tick."""
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        with self.assertLogs("chatbot.discord", level="WARNING") as cm:
+            self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
         self.assertEqual(self.sent, [])
+        self.assertTrue(any("didn't give a usable start time" in line for line in cm.output))
+
+    def test_guard_skip_reason_is_logged_once(self):
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=False))
+        with self.assertLogs("chatbot.discord", level="INFO") as cm:
+            self.notifier.tick(api, "testchan", "", True, "{channel} is live", now=1000.0)
+        self.assertTrue(any("no Discord webhook URL is set" in line for line in cm.output))
+        # Logged once per connection, not every tick -- a second call
+        # with the same missing setting shouldn't add a second line.
+        with self.assertRaises(AssertionError):
+            with self.assertLogs("chatbot.discord", level="INFO"):
+                self.notifier.tick(api, "testchan", "", True, "{channel} is live", now=1001.0)
 
     def test_offline_to_live_transition_announces(self):
         api = FakeStreamInfoTwitchAPI(StreamInfo(live=False))
         self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
-        api.info = StreamInfo(live=True, title="Hello", game_name="Just Chatting")
+        api.info = StreamInfo(live=True, title="Hello", game_name="Just Chatting", started_at=5000.0)
         self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1061.0)
         self.assertEqual(self.sent, [("https://discord.example/webhook", "testchan is live")])
 
     def test_stays_live_does_not_reannounce(self):
-        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, title="Hello", game_name="Just Chatting", started_at=5000.0))
         self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
         self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1061.0)
         self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1122.0)
-        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.sent), 1)  # the first tick announces (already-live, unannounced); later ticks don't re-send
 
     def test_respects_check_interval(self):
         api = FakeStreamInfoTwitchAPI(StreamInfo(live=False))
@@ -736,27 +1311,68 @@ class DiscordNotifierTests(unittest.TestCase):
         self.notifier.tick(api, "testchan", "", True, "{channel} is live", now=1061.0)
         self.assertEqual(self.sent, [])
 
-    def test_reset_clears_baseline_so_next_tick_rebaselines(self):
-        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+    def test_reset_does_not_clear_the_persisted_last_announced_key(self):
+        """reset() (called on every Bot.connect()) clears the
+        in-memory baseline/diagnostic flags, but must leave the
+        persisted last-announced-broadcast key alone -- that's the
+        whole point of persisting it instead of keeping it in memory
+        like the old design did."""
+        api = FakeStreamInfoTwitchAPI(StreamInfo(live=True, started_at=5000.0))
         self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1000.0)
+        self.assertAlmostEqual(
+            self.db.get_setting_float(discord_notify.LAST_ANNOUNCED_STREAM_SETTING_KEY), 5000.0
+        )
         self.notifier.reset()
-        # Still live after reset -- this should re-establish baseline, not announce, same as a fresh launch.
-        self.notifier.tick(api, "testchan", "https://discord.example/webhook", True, "{channel} is live", now=1061.0)
-        self.assertEqual(self.sent, [])
+        self.assertAlmostEqual(
+            self.db.get_setting_float(discord_notify.LAST_ANNOUNCED_STREAM_SETTING_KEY), 5000.0
+        )
 
     def test_render_fills_placeholders(self):
         info = StreamInfo(live=True, title="My Stream", game_name="Just Chatting")
-        text = DiscordNotifier._render("{channel} -- {title} -- {game}", "testchan", info)
+        text = DiscordNotifier.render("{channel} -- {title} -- {game}", "testchan", info)
         self.assertEqual(text, "testchan -- My Stream -- Just Chatting")
 
     def test_render_falls_back_to_raw_template_on_bad_placeholder(self):
         info = StreamInfo(live=True, title="My Stream", game_name="Just Chatting")
-        text = DiscordNotifier._render("{channel} went live at {nope}", "testchan", info)
+        text = DiscordNotifier.render("{channel} went live at {nope}", "testchan", info)
         self.assertEqual(text, "{channel} went live at {nope}")
 
     def test_send_calls_injected_sender(self):
         self.notifier.send("https://discord.example/webhook", "hi")
         self.assertEqual(self.sent, [("https://discord.example/webhook", "hi")])
+
+    def test_http_post_sets_a_real_user_agent(self):
+        """Real regression coverage for a live bug (2026-09-22): Ryan's
+        "Send test message" came back "Discord webhook rejected the
+        message: 403 ..." -- Discord sits behind Cloudflare, which
+        blocks urllib's own default User-Agent ("Python-urllib/3.x") as
+        a generic scripted client (Cloudflare error 1010), independent
+        of anything about the message itself. Every other test in this
+        class injects a fake sender and never touches _http_post, so
+        none of them would have caught a missing/default header here --
+        this one mocks urllib.request.urlopen directly (same pattern as
+        TwitchAPIModerationTests) and inspects the real Request."""
+        captured = {}
+
+        def fake_urlopen(req, timeout=10):
+            captured["req"] = req
+            cm = mock.MagicMock()
+            cm.__enter__.return_value.read.return_value = b""
+            cm.__exit__.return_value = False
+            return cm
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            DiscordNotifier._http_post("https://discord.example/webhook", "hello")
+        # Request.add_header() (which the headers={} constructor arg
+        # goes through) stores keys via str.capitalize(), so "User-
+        # Agent" is actually stored as "User-agent" -- and get_header()
+        # does NOT re-capitalize its argument to compensate, so looking
+        # it up as "User-Agent" silently returns None instead of
+        # raising. Confirmed empirically rather than assumed, after
+        # this test first failed on exactly that mismatch.
+        user_agent = captured["req"].headers.get("User-agent")
+        self.assertTrue(user_agent, "no User-Agent header was set at all")
+        self.assertNotIn("python-urllib", user_agent.lower())
 
 
 class StreamInfoModuleTests(unittest.TestCase):
@@ -1109,6 +1725,86 @@ class AlertsFollowerPollingTests(unittest.TestCase):
         self.assertEqual(api.calls, 0)
 
 
+class AlertsTitleGameChangeTests(unittest.TestCase):
+    """check_stream_info() diffs each live StreamInfo snapshot against
+    the last one seen -- fed from Bot._refresh_stream_info's existing
+    10s poll rather than a dedicated one (see alerts.py's module
+    docstring)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.db = Database(os.path.join(self.tmpdir, "chatbot.db"))
+        self.alerts = AlertsModule(self.db)
+
+    def test_first_live_check_establishes_baseline_without_announcing(self):
+        info = StreamInfo(live=True, title="Hello", game_name="Just Chatting")
+        self.assertEqual(self.alerts.check_stream_info(info), [])
+
+    def test_title_change_is_announced(self):
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="New title!", game_name="Just Chatting"))
+        self.assertEqual(len(messages), 1)
+        self.assertIn("New title!", messages[0])
+
+    def test_game_change_is_announced(self):
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Balatro"))
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Balatro", messages[0])
+
+    def test_both_changing_together_gives_one_combined_message(self):
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="New title!", game_name="Balatro"))
+        self.assertEqual(len(messages), 1)
+        self.assertIn("New title!", messages[0])
+        self.assertIn("Balatro", messages[0])
+
+    def test_no_change_announces_nothing(self):
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        self.assertEqual(messages, [])
+
+    def test_going_offline_does_not_look_like_a_change(self):
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=False))
+        self.assertEqual(messages, [])
+
+    def test_coming_back_online_with_same_title_after_offline_gap_announces_nothing(self):
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        self.alerts.check_stream_info(StreamInfo(live=False))  # stream ends
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        self.assertEqual(messages, [])
+
+    def test_none_info_announces_nothing(self):
+        self.assertEqual(self.alerts.check_stream_info(None), [])
+
+    def test_disabled_globally_suppresses_title_game_alerts(self):
+        self.db.set_setting("alerts_enabled", "0")
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="New!", game_name="Just Chatting"))
+        self.assertEqual(messages, [])
+
+    def test_title_game_type_disabled_suppresses_it_but_not_other_alerts(self):
+        self.db.set_setting("alerts_title_game_enabled", "0")
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="New!", game_name="Just Chatting"))
+        self.assertEqual(messages, [])
+        msg = self.alerts.handle_usernotice({"msg-id": "sub", "display-name": "Foo"})
+        self.assertIsNotNone(msg)
+
+    def test_reconnect_resets_baseline_so_no_false_announce(self):
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        self.alerts.reset_session()
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="Something else", game_name="Balatro"))
+        self.assertEqual(messages, [])
+
+    def test_custom_template_is_used(self):
+        self.db.set_setting("alerts_title_changed_message", "New title -- {title}")
+        self.alerts.check_stream_info(StreamInfo(live=True, title="Hello", game_name="Just Chatting"))
+        messages = self.alerts.check_stream_info(StreamInfo(live=True, title="Hi", game_name="Just Chatting"))
+        self.assertEqual(messages, ["New title -- Hi"])
+
+
 class IRCUsernoticeDispatchTests(unittest.TestCase):
     """Confirms irc_client.py actually parses USERNOTICE lines and
     invokes on_usernotice with the tag dict, mirroring
@@ -1425,6 +2121,56 @@ class PathsTests(unittest.TestCase):
         with mock.patch.object(sys, "frozen", True, create=True), \
                 mock.patch.object(sys, "executable", "/fake/dist/TwitchChatBotV2.exe"):
             self.assertEqual(paths.app_dir(), "/fake/dist")
+
+
+class RunBotAUMIDTests(unittest.TestCase):
+    """run_bot._set_windows_app_id() sets a stable Windows taskbar
+    identity (AUMID). Regression coverage added 2026-09-06 after a
+    live report of the taskbar reverting to Tk's stock feather icon
+    with *nothing* in lcbot.log about it: the previous version of this
+    function called SetCurrentProcessExplicitAppUserModelID but never
+    looked at its return value (a COM HRESULT -- 0 means success, and
+    ctypes doesn't raise just because it came back non-zero), so a
+    real failure here could have been completely invisible. Every
+    outcome now gets logged -- these tests fake a Windows environment
+    (this suite otherwise only runs on Linux) by bolting a fake
+    `windll` onto the real `ctypes` module for the duration of each
+    test, since `ctypes.windll` doesn't exist at all outside Windows."""
+
+    def test_noop_and_silent_on_non_windows(self):
+        with mock.patch.object(run_bot.sys, "platform", "linux"):
+            with self.assertNoLogs("chatbot.run_bot"):
+                run_bot._set_windows_app_id()
+
+    def test_logs_info_on_success(self):
+        fake_shell32 = mock.MagicMock()
+        fake_shell32.SetCurrentProcessExplicitAppUserModelID.return_value = 0
+        fake_windll = mock.MagicMock(shell32=fake_shell32)
+        with mock.patch.object(run_bot.sys, "platform", "win32"), \
+                mock.patch.object(ctypes, "windll", fake_windll, create=True):
+            with self.assertLogs("chatbot.run_bot", level="INFO") as cm:
+                run_bot._set_windows_app_id()
+        self.assertTrue(any("set Windows AppUserModelID" in line for line in cm.output))
+
+    def test_logs_warning_on_nonzero_hresult(self):
+        fake_shell32 = mock.MagicMock()
+        fake_shell32.SetCurrentProcessExplicitAppUserModelID.return_value = -2147024809
+        fake_windll = mock.MagicMock(shell32=fake_shell32)
+        with mock.patch.object(run_bot.sys, "platform", "win32"), \
+                mock.patch.object(ctypes, "windll", fake_windll, create=True):
+            with self.assertLogs("chatbot.run_bot", level="WARNING") as cm:
+                run_bot._set_windows_app_id()
+        self.assertTrue(any("HRESULT" in line for line in cm.output))
+
+    def test_logs_exception_when_ctypes_call_raises(self):
+        fake_shell32 = mock.MagicMock()
+        fake_shell32.SetCurrentProcessExplicitAppUserModelID.side_effect = OSError("boom")
+        fake_windll = mock.MagicMock(shell32=fake_shell32)
+        with mock.patch.object(run_bot.sys, "platform", "win32"), \
+                mock.patch.object(ctypes, "windll", fake_windll, create=True):
+            with self.assertLogs("chatbot.run_bot", level="ERROR") as cm:
+                run_bot._set_windows_app_id()
+        self.assertTrue(any("couldn't set Windows AppUserModelID" in line for line in cm.output))
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ class EmoteBadgeCache:
         self._badge_images: dict[str, Optional[tk.PhotoImage]] = {}  # key "set_id/version"
         self._badge_urls: dict[str, str] = {}
         self._badges_loaded = False
+        self._logged_no_api_yet = False
 
     # -- emotes ----------------------------------------------------------
     def get_emote_image(self, emote_id: str) -> Optional[tk.PhotoImage]:
@@ -60,7 +61,14 @@ class EmoteBadgeCache:
             return self._badge_images[key]
         url = self._badge_urls.get(key)
         if not url:
-            self._badge_images[key] = None
+            if self._badges_loaded:
+                # Only cache "no such badge" once a real load has
+                # actually completed -- otherwise a badge lookup that
+                # comes in before/during a failed or still-pending
+                # load (see _ensure_badges_loaded) would get written
+                # off as permanently missing even though it may exist
+                # once badges actually finish loading.
+                self._badge_images[key] = None
             return None
         safe_key = key.replace("/", "_")
         path = os.path.join(self.cache_dir, f"badge_{safe_key}.png")
@@ -74,8 +82,20 @@ class EmoteBadgeCache:
             return
         api = self._get_twitch_api()
         if api is None:
+            # Badges need the *broadcaster* to be authorized (self.bot.
+            # twitch_api) -- being connected to chat only needs the bot
+            # account, which is a very normal setup to stop at (nothing
+            # else requires the broadcaster login). Logged once, not
+            # per-message, so a "why are badges missing" report has a
+            # concrete answer in lcbot.log instead of silence -- same
+            # diagnostic-first approach as the taskbar icon investigation.
+            if not self._logged_no_api_yet:
+                self._logged_no_api_yet = True
+                logger.info(
+                    "chat badges unavailable: broadcaster isn't authorized yet "
+                    "(Settings -> \"Log in with Twitch (streamer account)\")"
+                )
             return  # not connected/authorized yet -- retry next time a badge is requested
-        self._badges_loaded = True
         try:
             self._index_badge_set(api.get_global_badges())
             login = (self._get_broadcaster_login() or "").strip().lower()
@@ -84,7 +104,33 @@ class EmoteBadgeCache:
                 if broadcaster_id:
                     self._index_badge_set(api.get_channel_badges(broadcaster_id))
         except Exception:
-            logger.exception("failed to load chat badges")
+            # Found investigating a report of a specific badge (WizeBot's)
+            # showing up missing in the Console tab (2026-09-07): this
+            # used to set _badges_loaded = True *before* the fetch, so a
+            # single transient failure here (a network hiccup right as
+            # the app connects, before Twitch's API is fully reachable)
+            # permanently marked every badge as "loaded" with an empty
+            # _badge_urls table -- meaning literally every badge for
+            # every user, for the rest of that run, would silently come
+            # back as None and never even retry. Not setting the flag on
+            # failure means the very next badge lookup (the next chat
+            # message) tries again instead of staying broken forever.
+            logger.exception("failed to load chat badges -- will retry on the next badge lookup")
+            return
+        self._badges_loaded = True
+
+    def reset(self) -> None:
+        """Called on every successful (re)connect (see MainWindow's
+        "bot_connected" handling) so a fresh session always re-fetches
+        badges instead of trusting a stale load from before a reconnect
+        or a re-authorization (e.g. after picking up new scopes) --
+        also gives a permanently-failed load (see _ensure_badges_loaded)
+        a natural retry point even if no message happens to trigger one
+        first."""
+        self._badges_loaded = False
+        self._badge_urls.clear()
+        self._badge_images.clear()
+        self._logged_no_api_yet = False
 
     def _index_badge_set(self, data: dict) -> None:
         for entry in data.get("data", []):

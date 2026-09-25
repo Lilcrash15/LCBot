@@ -36,7 +36,18 @@ DEFAULT_PORT = 17563
 # category "Chat Bot") on 2026-09-01.
 LCBOT_CLIENT_ID = "1vf3133y15knihp96w59gly8g5ip2h"
 
-CHAT_SCOPES = ["chat:read", "chat:edit"]
+# moderator:manage:banned_users lets the bot ban/timeout/unban via the
+# Helix Moderation API -- moderator:manage:chat_messages lets it delete
+# a single message the same way. Both replace the old /ban, /timeout,
+# /delete, /unban IRC chat commands, which Twitch retired (see
+# modules/twitch_api.py). These go on the *bot* account's token, not
+# the streamer's, because Twitch requires moderator_id to be the
+# token's own owner, and it's the bot -- not the streamer -- that's
+# actually modded in the channel.
+CHAT_SCOPES = [
+    "chat:read", "chat:edit",
+    "moderator:manage:banned_users", "moderator:manage:chat_messages",
+]
 # user:write:chat lets the broadcaster's own token post chat messages via
 # the Helix Chat API -- powers the GUI's "chat as streamer" identity option.
 # channel:manage:broadcast lets it update the stream title/category --

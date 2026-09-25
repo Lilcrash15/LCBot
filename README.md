@@ -33,7 +33,13 @@ next to the app.
 - **Moderation**: link filter (with a whitelist), excessive-caps filter,
   symbol-spam filter, banned-phrase filter, repeated-message filter,
   with escalating strikes -> timeout. Mods and the broadcaster are
-  always exempt.
+  always exempt. `!permit username` (mod-only) temporarily exempts one
+  user's next message from every filter -- handy for a raid host
+  dropping a link, or letting someone through who tripped a filter by
+  mistake. The exemption covers exactly one message and expires on its
+  own after a configurable window (Moderation tab -> Thresholds
+  -> "!permit exemption length (s)", 60s by default) even if they
+  never send one.
 - **Timers**: scheduled chat announcements that only fire once chat's
   actually had activity since the last one.
 - **Song requests**: `!sr`, `!skip`, `!wrongsong`, `!queue`, `!song`,
@@ -46,15 +52,18 @@ next to the app.
   live "Live Viewers" tile, refreshed automatically every few seconds
   while connected. A "Basic" box at the top of the Dashboard (same
   spot the original AnkhBot put it) lets you update your title and
-  category without leaving the app: click the refresh (↻) button to
-  pull in the current title/game, edit the Title field, type a few
-  letters into the Game field to search Twitch's own category list
-  and pick the exact match from the dropdown (so it matches Twitch's
-  category exactly, not just a typed name), then click the up-arrow
-  (↑) button to push the change to Twitch. Needs the
-  `channel:manage:broadcast` scope on the broadcaster token -- if you
-  authorized before that was added, click "Log in with Twitch
-  (streamer account)" again in Settings to pick it up.
+  category without leaving the app: it loads the real current title/
+  game automatically the moment you connect (and remembers the last
+  values it saw even before that, across relaunches, instead of
+  showing blank fields) -- click the refresh (↻) button any time to
+  pull the latest manually, edit the Title field, type a few letters
+  into the Game field to search Twitch's own category list and pick
+  the exact match from the dropdown (so it matches Twitch's category
+  exactly, not just a typed name), then click the up-arrow (↑) button
+  to push the change to Twitch. Needs the `channel:manage:broadcast`
+  scope on the broadcaster token -- if you authorized before that was
+  added, click "Log in with Twitch (streamer account)" again in
+  Settings to pick it up.
 - **Console**: the live chat log renders Twitch chat badges (mod/VIP/
   sub/broadcaster/etc.) and Twitch emotes inline, not as raw text --
   images are fetched from Twitch's CDN on first use and cached to disk
@@ -66,9 +75,10 @@ next to the app.
   the broadcaster token from step 3) -- the same choice the original
   AnkhBot offered. Click any username in the log to view their recent
   messages or timeout/ban/unban them, same as clicking a name in
-  Twitch's own chat -- moderation actions send the same `/timeout`,
-  `/ban`, `/unban` chat commands the auto-moderation system uses, so
-  the bot account needs to actually be a moderator in your channel for
+  Twitch's own chat -- moderation actions go through the same Twitch
+  API calls the auto-moderation system uses (Twitch retired /timeout,
+  /ban, /unban, /delete as plain chat commands), so the bot account
+  needs to actually be logged in and a moderator in your channel for
   them to take effect.
 - **App icon**: drop a `.ico` file at `assets/icon.ico` and both the
   running app's window/taskbar icon and the compiled exe's file icon
@@ -84,16 +94,22 @@ next to the app.
   either. The message supports `{channel}`, `{title}`, and `{game}`
   placeholders. Use "Send test message" to confirm the webhook works
   before you rely on it.
-- **Chat alerts**: announces new followers, subs/resubs/gift subs, and
-  raids right in chat, each independently toggleable with its own
-  editable message template (Settings -> Chat Alerts). Subs, resubs,
-  gift subs, and raids fire in real time straight off Twitch chat, the
-  same way the original AnkhBot picked them up; new followers are
-  detected by checking Twitch every minute (Twitch removed the old
-  live "someone followed" chat event years ago, so this is the modern
-  equivalent). Reconnecting or relaunching never floods chat thanking
-  your whole existing follower list -- only follows *after* that point
-  get announced.
+- **Chat alerts**: announces new followers, subs/resubs/gift subs,
+  raids, and title/game changes right in chat, each independently
+  toggleable with its own editable message template (Settings -> Chat
+  Alerts). Subs, resubs, gift subs, and raids fire in real time
+  straight off Twitch chat, the same way the original AnkhBot picked
+  them up; new followers are detected by checking Twitch every minute
+  (Twitch removed the old live "someone followed" chat event years
+  ago, so this is the modern equivalent); title/game changes are
+  caught by watching for a difference the next time the bot checks
+  (every ~10s while live) -- covers a title change, a game change, or
+  both together in one message, and works no matter how the change was
+  made (LCBot's own Dashboard, Twitch's own dashboard, or the mobile
+  app). Reconnecting or relaunching never floods chat thanking your
+  whole existing follower list, or announces a false title/game
+  "change" just from connecting -- only a real change *after* that
+  point gets announced.
 - **Backup & Restore**: Settings -> Backup & Restore. "Backup Now"
   saves your commands, points, quotes, timers, and settings to a
   `.lcbotbak` file (a safe point-in-time snapshot, taken with SQLite's
@@ -383,8 +399,7 @@ get from a plain text command.
 ## Roadmap ideas (not built yet)
 
 - Duel and Free-for-All minigames (Heist and Boss Battle are done)
-- Per-rank cooldown overrides and a `!permit` command to bypass the
-  link filter once
+- Per-rank cooldown overrides
 
 ## Releases
 

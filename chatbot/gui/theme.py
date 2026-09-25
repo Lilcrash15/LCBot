@@ -229,22 +229,50 @@ def apply_theme(root: tk.Tk, colors: dict[str, str]) -> ttk.Style:
     style.configure("Heading.TLabel", background=BG, foreground=ACCENT, font=("Segoe UI", 10, "bold"))
     style.configure("Stat.TLabel", background=BG, foreground=FG, font=("Segoe UI", 18, "bold"))
 
-    style.configure("TButton", background=FIELD_BG, foreground=FG, borderwidth=1,
-                     focuscolor=ACCENT, padding=(10, 4))
+    # Flat, borderless buttons with roomier padding instead of the
+    # thin-bordered boxy look every button used to have (Ryan: "I want
+    # more modern buttons and text boxes" -- singling out the
+    # Dashboard's refresh/update buttons specifically as "dated").
+    # Hover/pressed still read clearly via a solid accent fill, same
+    # language ttk.Notebook tabs already use for "selected" -- no new
+    # visual vocabulary, just applied more consistently.
+    style.configure("TButton", background=FIELD_BG, foreground=FG, borderwidth=0,
+                     relief="flat", focuscolor=ACCENT, padding=(14, 8))
     style.map("TButton",
-              background=[("active", ACCENT), ("pressed", ACCENT_DIM)],
-              foreground=[("active", SELECT_FG)])
+              background=[("pressed", ACCENT_DIM), ("active", ACCENT)],
+              foreground=[("pressed", SELECT_FG), ("active", SELECT_FG)])
+
+    # For small icon-glyph-only buttons (currently just the Dashboard's
+    # "Basic" box refresh/update buttons) -- same flat/hover language
+    # as TButton, just a bigger glyph and tighter padding so a single
+    # unicode arrow reads clearly instead of looking like a stray
+    # letter lost in a tiny bordered box.
+    style.configure("Icon.TButton", background=FIELD_BG, foreground=FG, borderwidth=0,
+                     relief="flat", focuscolor=ACCENT, padding=(8, 4), font=("Segoe UI", 13, "bold"))
+    style.map("Icon.TButton",
+              background=[("pressed", ACCENT_DIM), ("active", ACCENT)],
+              foreground=[("pressed", SELECT_FG), ("active", SELECT_FG)])
 
     style.configure("TCheckbutton", background=BG, foreground=FG)
     style.map("TCheckbutton", background=[("active", BG)], foreground=[("active", ACCENT)])
 
+    # Entries/comboboxes/spinboxes: roomier internal padding (was
+    # cramped hard against the border) and a border that actually
+    # brightens on focus instead of staying the same dim color
+    # whether a field is active or not -- both read as "modern" on
+    # their own, and the focus-color change also reinforces that the
+    # Bot/Streamer combobox's fix (see MainWindow._on_send_identity_
+    # selected) is showing real keyboard focus, not a stuck highlight.
     style.configure("TEntry", fieldbackground=FIELD_BG, foreground=FG, insertcolor=FG,
-                     bordercolor=ACCENT_DIM)
+                     bordercolor=ACCENT_DIM, padding=(8, 6))
+    style.map("TEntry", bordercolor=[("focus", ACCENT), ("!focus", ACCENT_DIM)])
     style.configure("TSpinbox", fieldbackground=FIELD_BG, foreground=FG, arrowsize=12,
-                     bordercolor=ACCENT_DIM)
+                     bordercolor=ACCENT_DIM, padding=(8, 6))
+    style.map("TSpinbox", bordercolor=[("focus", ACCENT), ("!focus", ACCENT_DIM)])
     style.configure("TCombobox", fieldbackground=FIELD_BG, background=FIELD_BG, foreground=FG,
-                     arrowsize=12, bordercolor=ACCENT_DIM)
-    style.map("TCombobox", fieldbackground=[("readonly", FIELD_BG)], foreground=[("readonly", FG)])
+                     arrowsize=12, bordercolor=ACCENT_DIM, padding=(8, 6))
+    style.map("TCombobox", fieldbackground=[("readonly", FIELD_BG)], foreground=[("readonly", FG)],
+              bordercolor=[("focus", ACCENT), ("!focus", ACCENT_DIM)])
     root.option_add("*TCombobox*Listbox.background", FIELD_BG)
     root.option_add("*TCombobox*Listbox.foreground", FG)
     root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)

@@ -161,6 +161,7 @@ DEFAULT_SETTINGS = {
     "moderation_banned_words_enabled": "1",
     "moderation_timeout_seconds": "600",
     "moderation_strikes_before_timeout": "2",
+    "moderation_permit_seconds": "60",       # how long a !permit'd user's next message is exempt from every filter
     "timers_global_enabled": "1",
     "songrequests_enabled": "1",
     "songrequests_max_duration_seconds": "600",
@@ -187,6 +188,10 @@ DEFAULT_SETTINGS = {
     "alerts_resub_message": "{user} resubscribed for {months} months! \U0001F389",
     "alerts_subgift_message": "{user} gifted a sub to {recipient}! \U0001F381",
     "alerts_raid_message": "{user} is raiding with {viewers} viewers! Welcome raiders! \U0001F680",
+    "alerts_title_game_enabled": "1",
+    "alerts_title_changed_message": "Stream title updated: {title}",
+    "alerts_game_changed_message": "Now playing: {game}",
+    "alerts_title_game_changed_message": "Now playing {game} -- {title}",
     "hide_support_popup": "0",
     # Themes tab (chatbot/gui/theme.py) -- theme_name is one of
     # theme.THEME_ORDER ("classic"/"dark"/"light"/"synthwave"/"forest"/

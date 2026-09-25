@@ -24,10 +24,46 @@ logger = logging.getLogger("chatbot.irc")
 TWITCH_HOST = "irc.chat.twitch.tv"
 TWITCH_PORT = 6697
 
+# Twitch's own IRC servers ping idle clients to keep the connection
+# alive -- not formally documented with an exact interval, but
+# consistently reported in practice as roughly every ~5 minutes (see
+# Twitch's own developer forum: "Keepalive question for Serverless
+# Chatbot", discuss.dev.twitch.com/t/49857). If literally nothing --
+# not even a PING -- has come through in noticeably longer than that,
+# the connection is almost certainly a "zombie": still open as far as
+# this process's socket is concerned, but silently dead on the wire
+# (a router/NAT dropping an idle mapping after Ryan's PC has been
+# streaming for hours, a sleeping network adapter, etc.) -- something
+# a plain recv()-with-timeout loop can't detect on its own, since it
+# just keeps timing out forever with no actual OSError to catch. This
+# was the real, confirmed root cause of "disconnects during a long
+# stream and I have to click Connect again" (2026-09-25): Ryan's own
+# lcbot.log showed the app just sitting there thinking it was still
+# connected, with no error of any kind, until he noticed and manually
+# reconnected.
+IDLE_CONNECTION_TIMEOUT_SECONDS = 360  # 6 minutes -- ~1 minute of margin above Twitch's own ~5-minute cadence
+
+# How long to wait between automatic reconnect attempts after an
+# unexpected drop (the idle-timeout above, or Twitch's own RECONNECT
+# command -- see _RECONNECT_RE below) before giving up and surfacing a
+# real "Disconnected" to the GUI. Twitch's own docs describe RECONNECT
+# as routine, sent "for maintenance reasons" with "an indeterminate"
+# amount of time before the server actually closes the connection
+# (dev.twitch.tv/docs/chat/irc/) -- exactly the kind of thing a long
+# stream is more likely to run into, and exactly the kind of thing
+# worth quietly retrying through instead of surfacing to Ryan as a
+# disconnect he has to notice and fix by hand.
+RECONNECT_BACKOFF_SECONDS = (2.0, 5.0, 10.0, 20.0, 30.0)
+
 # @tag1=val1;tag2=val2 :nick!user@host PRIVMSG #channel :message text
 _TAGS_RE = re.compile(r"^@(?P<tags>\S+) :(?P<prefix>\S+) (?P<command>\S+) (?P<params>.*)$")
 _NO_TAGS_RE = re.compile(r"^:(?P<prefix>\S+) (?P<command>\S+) (?P<params>.*)$")
 _PING_RE = re.compile(r"^PING(?: :(?P<payload>.*))?$")
+# Sent as a bare ":tmi.twitch.tv RECONNECT" with no trailing params at
+# all -- deliberately its own regex rather than routing through
+# _NO_TAGS_RE, which requires a space *after* the command before its
+# params group, and so never matches a command with zero params.
+_RECONNECT_RE = re.compile(r"^:\S+ RECONNECT\s*$")
 
 
 @dataclass
@@ -113,6 +149,15 @@ class TwitchIRCClient:
         self._sent_timestamps: list[float] = []
         self._send_lock = threading.Lock()
         self._announced_joined = False
+        # Remembered from connect() so an unexpected drop can silently
+        # re-establish the same connection (see _attempt_auto_reconnect)
+        # without needing Bot.connect() to run again -- refresh_apis(),
+        # the per-module session resets, etc. all stay untouched, since
+        # nothing about auth or config actually changed, just the
+        # transport underneath it.
+        self._last_oauth_token = ""
+        self._last_activity = 0.0
+        self._reconnect_requested = False
 
     @property
     def connected(self) -> bool:
@@ -125,8 +170,28 @@ class TwitchIRCClient:
         self._stop_event.clear()
         self._channel = channel.lower().lstrip("#")
         self._our_nick = bot_username.lower()
+        self._last_oauth_token = oauth_token
         self._announced_joined = False
+        self._reconnect_requested = False
 
+        self._establish_socket(bot_username, oauth_token, self._channel, timeout=timeout)
+
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True, name="irc-reader")
+        self._sender_thread = threading.Thread(target=self._send_loop, daemon=True, name="irc-sender")
+        self._reader_thread.start()
+        self._sender_thread.start()
+
+    def _establish_socket(
+        self, bot_username: str, oauth_token: str, channel: str, timeout: float = 15.0, reconnect: bool = False
+    ) -> None:
+        """The actual socket-level handshake (TCP+TLS connect, then
+        CAP/PASS/NICK/JOIN) -- pulled out of connect() so
+        _attempt_auto_reconnect() can redo just this part on an
+        unexpected drop, without re-running connect()'s own
+        bookkeeping (which would incorrectly reset _stop_event/etc. on
+        every retry) or anything in Bot.connect() above this class
+        entirely. Raises OSError on failure, same as a raw socket
+        connect always would -- callers decide what that means."""
         raw_sock = socket.create_connection((TWITCH_HOST, TWITCH_PORT), timeout=timeout)
         context = ssl.create_default_context()
         self._sock = context.wrap_socket(raw_sock, server_hostname=TWITCH_HOST)
@@ -136,15 +201,14 @@ class TwitchIRCClient:
         self._raw_send(f"CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership")
         self._raw_send(f"PASS {token}")
         self._raw_send(f"NICK {bot_username.lower()}")
-        self._raw_send(f"JOIN #{self._channel}")
+        self._raw_send(f"JOIN #{channel}")
 
         self._connected = True
-        self.on_status(f"Connected, joining #{self._channel}...")
-
-        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True, name="irc-reader")
-        self._sender_thread = threading.Thread(target=self._send_loop, daemon=True, name="irc-sender")
-        self._reader_thread.start()
-        self._sender_thread.start()
+        self._last_activity = time.time()
+        if reconnect:
+            self.on_status(f"Reconnected automatically, rejoining #{channel}...")
+        else:
+            self.on_status(f"Connected, joining #{channel}...")
 
     def disconnect(self) -> None:
         self._stop_event.set()
@@ -197,23 +261,90 @@ class TwitchIRCClient:
             time.sleep(0.35)  # small courtesy gap between individual sends
 
     def _read_loop(self) -> None:
-        buffer = ""
+        # Outer loop: one iteration per socket "generation" -- runs the
+        # inner read loop against whatever socket is currently live,
+        # and on an unexpected drop (not a deliberate disconnect()),
+        # tries to silently reconnect and keep going on the SAME
+        # thread rather than spawning a new one. Only exits (and tells
+        # the GUI "Disconnected") on a deliberate stop, or once
+        # auto-reconnect has genuinely exhausted its attempts.
         while not self._stop_event.is_set():
-            try:
-                chunk = self._sock.recv(4096)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if not chunk:
-                break
-            buffer += chunk.decode("utf-8", errors="replace")
-            while "\r\n" in buffer:
-                line, buffer = buffer.split("\r\n", 1)
-                if line:
-                    self._handle_line(line)
+            self._reconnect_requested = False
+            self._last_activity = time.time()
+            buffer = ""
+            while not self._stop_event.is_set():
+                try:
+                    chunk = self._sock.recv(4096)
+                except socket.timeout:
+                    if time.time() - self._last_activity > IDLE_CONNECTION_TIMEOUT_SECONDS:
+                        logger.warning(
+                            "No data from Twitch IRC in over %ds (not even a keepalive PING) -- "
+                            "treating the connection as dead", IDLE_CONNECTION_TIMEOUT_SECONDS,
+                        )
+                        break
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self._last_activity = time.time()
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\r\n" in buffer:
+                    line, buffer = buffer.split("\r\n", 1)
+                    if line:
+                        self._handle_line(line)
+                if self._reconnect_requested:
+                    break
+            # Inner loop ended -- figure out why before deciding what to do.
+            self._connected = False
+            if self._stop_event.is_set():
+                break  # a deliberate disconnect() already set this -- nothing to reconnect
+            if self._attempt_auto_reconnect():
+                continue  # back to the top with a fresh socket, still the same thread
+            break  # every retry failed -- give up and tell the GUI for real
+        # Defensive, for the rare race where a reconnect attempt lands
+        # a fresh socket right as disconnect() is also tearing things
+        # down on another thread -- make sure we end up in a genuinely
+        # closed state no matter which side "won".
         self._connected = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
         self.on_status("Disconnected")
+
+    def _attempt_auto_reconnect(self) -> bool:
+        """Tries to silently re-establish the connection after an
+        unexpected drop, before bothering the GUI with a real
+        "Disconnected" status. Returns True once back online, False if
+        every attempt in RECONNECT_BACKOFF_SECONDS failed (the caller
+        then falls through to a real disconnect, exactly like before
+        this existed)."""
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        channel, username, token = self._channel, self._our_nick, self._last_oauth_token
+        for attempt, delay in enumerate(RECONNECT_BACKOFF_SECONDS, start=1):
+            if self._stop_event.wait(delay):
+                return False  # disconnect() ran while we were waiting -- stop trying
+            logger.info("Auto-reconnect attempt %d/%d to Twitch IRC...", attempt, len(RECONNECT_BACKOFF_SECONDS))
+            try:
+                self._establish_socket(username, token, channel, reconnect=True)
+            except OSError as exc:
+                logger.warning("Auto-reconnect attempt %d/%d failed: %s", attempt, len(RECONNECT_BACKOFF_SECONDS), exc)
+                continue
+            logger.info("Auto-reconnected to Twitch IRC after %d attempt(s)", attempt)
+            return True
+        logger.warning(
+            "Auto-reconnect gave up after %d attempts over about %ds -- surfacing a real disconnect",
+            len(RECONNECT_BACKOFF_SECONDS), int(sum(RECONNECT_BACKOFF_SECONDS)),
+        )
+        return False
 
     def _handle_line(self, line: str) -> None:
         self.on_raw(line)
@@ -222,6 +353,17 @@ class TwitchIRCClient:
         if ping_match:
             payload = ping_match.group("payload") or ""
             self._raw_send(f"PONG :{payload}")
+            return
+
+        if _RECONNECT_RE.match(line):
+            # Twitch's own signal that it's about to close this
+            # connection for maintenance, with "an indeterminate"
+            # amount of time before it actually does
+            # (dev.twitch.tv/docs/chat/irc/) -- rather than wait it
+            # out, flag it so _read_loop breaks out and reconnects
+            # proactively on its own schedule instead of Twitch's.
+            logger.info("Twitch sent RECONNECT (server-side maintenance) -- reconnecting proactively")
+            self._reconnect_requested = True
             return
 
         tags: dict = {}

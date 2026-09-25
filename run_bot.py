@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point -- launches the Twitch Chat Bot desktop app.
+"""Entry point -- launches LCBot, the Twitch chat bot desktop app.
 
 Usage:
     python run_bot.py
@@ -13,6 +13,9 @@ import logging
 import logging.handlers
 import os
 import sys
+
+
+_logger = logging.getLogger("chatbot.run_bot")
 
 
 def _set_windows_app_id() -> None:
@@ -36,18 +39,37 @@ def _set_windows_app_id() -> None:
     of whichever temp path or icon-cache state a given launch happens
     to have. Safe to call on any platform: a no-op (not an exception)
     anywhere `ctypes.windll` doesn't exist, i.e. everywhere but
-    Windows."""
+    Windows.
+
+    Logs its actual outcome (2026-09-06, after the icon still came
+    back as the stock feather with nothing in lcbot.log to explain
+    why): the previous version of this function called
+    SetCurrentProcessExplicitAppUserModelID but never looked at its
+    return value -- it's a COM HRESULT, 0 (S_OK) on success, non-zero
+    on failure, and ctypes happily returns that value without raising
+    an exception either way, so a genuine failure here could have been
+    silently invisible even with the try/except in place. Now every
+    outcome (success, a non-zero HRESULT, or a raised exception) gets
+    logged, so if the icon is still wrong next time, the log will
+    actually say whether this call even worked."""
     if not sys.platform.startswith("win"):
         return
+    app_id = "LCBot.TwitchChatBotV2"
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LCBot.TwitchChatBotV2")
+        hresult = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        if hresult == 0:
+            _logger.info("set Windows AppUserModelID to %r", app_id)
+        else:
+            _logger.warning(
+                "SetCurrentProcessExplicitAppUserModelID(%r) returned HRESULT 0x%08x (non-zero = failed)",
+                app_id, hresult & 0xFFFFFFFF,
+            )
     except (AttributeError, OSError):
-        pass  # cosmetic (taskbar identity/grouping) only -- never worth blocking startup over
+        _logger.exception("couldn't set Windows AppUserModelID %r (taskbar identity/grouping only -- cosmetic)", app_id)
 
 
 def main() -> None:
-    _set_windows_app_id()
     handlers: list = [logging.StreamHandler()]
     try:
         # The compiled exe is built --windowed (no console window), so
@@ -71,6 +93,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=handlers,
     )
+    # Logging has to be configured before this call (moved here from
+    # being the very first line of main()) so its outcome actually
+    # lands in lcbot.log instead of going nowhere -- still well before
+    # any window is created (that happens inside run() below), which
+    # is the actual requirement Microsoft's docs place on this call.
+    _set_windows_app_id()
     try:
         from chatbot.gui.main_window import run
     except ImportError as exc:

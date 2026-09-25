@@ -24,7 +24,7 @@ import time
 import tkinter as tk
 import webbrowser
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
-from typing import Optional
+from typing import Callable, Optional
 
 from chatbot import __version__
 from chatbot.core import backup, oauth, overlay_server, update_check
@@ -35,6 +35,7 @@ from chatbot.core.friendly_errors import friendly_error_text
 from chatbot.core.irc_client import ChatMessage
 from chatbot.core.paths import app_dir
 from chatbot.gui import theme
+from chatbot.modules.twitch_api import StreamInfo, TwitchAPIError
 from chatbot.gui.emote_cache import EmoteBadgeCache
 from chatbot.gui.theme import style_listbox, style_text_widget
 
@@ -45,6 +46,41 @@ from chatbot.gui.theme import style_listbox, style_text_widget
 # always present with no bundling needed.
 CHAT_FONT_FAMILY = "Segoe UI"
 CHAT_FONT_SIZE = 12
+
+# Windows' own color-emoji/symbol font -- used as an explicit fallback
+# for characters Segoe UI itself doesn't have a glyph for (2026-09-09,
+# investigating a report of "icons and emotes not showing" -- a
+# screenshot showed WizeBot's own status message rendering some of its
+# punctuation-like symbols, e.g. U+2757 "!" and U+274C "X", as tofu/
+# missing-glyph boxes, even though real Twitch badges/emotes, which are
+# fetched as actual images rather than text glyphs, rendered fine right
+# next to it). Tk's own automatic Windows font-fallback is documented
+# to be inconsistent for exactly this -- see the CPython tracker,
+# https://github.com/python/cpython/issues/101032, where the very same
+# character renders differently depending on what's around it -- so
+# this explicitly tags the specific runs that need it instead of
+# hoping Tk picks a working font on its own.
+EMOJI_FONT_FAMILY = "Segoe UI Emoji"
+
+# Standard Unicode blocks that hold most of the symbols/dingbats/emoji
+# Segoe UI itself doesn't cover (Unicode's own block chart -- not a
+# guess at individual characters). Covers the two specific characters
+# from Ryan's screenshot (U+2757, U+274C) plus emoji generally, so a
+# future bot's own status text doesn't need a one-off fix each time.
+_EMOJI_FALLBACK_RANGES = (
+    (0x2600, 0x27BF),    # Misc Symbols + Dingbats (incl. U+2757 ❗, U+274C ❌)
+    (0x2B00, 0x2BFF),    # Misc Symbols and Arrows (stars, heavy arrows, etc.)
+    (0x1F1E6, 0x1F1FF),  # Regional Indicator Symbols (flag emoji)
+    (0x1F300, 0x1FAFF),  # Misc Symbols/Pictographs, Emoticons, Transport, Supplemental, Extended-A/B
+    (0xFE0F, 0xFE0F),    # variation selector-16 (forces emoji presentation)
+    (0x20E3, 0x20E3),    # combining enclosing keycap (e.g. keycap digit emoji)
+)
+
+
+def _needs_emoji_font(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _EMOJI_FALLBACK_RANGES)
+
 
 logger = logging.getLogger("chatbot.main_window")
 
@@ -59,7 +95,7 @@ SUPPORT_URL = "https://streamlabs.com/lilcrash15/tip"
 class MainWindow(tk.Tk):
     def __init__(self, config: ConfigStore, db: Database):
         super().__init__()
-        self.title(f"Twitch Chat Bot -- v{__version__}")
+        self.title(f"LCBot -- v{__version__}")
         self.geometry("1180x720")
         self.minsize(1180, 600)
 
@@ -75,8 +111,30 @@ class MainWindow(tk.Tk):
         self.style = theme.apply_theme(self, initial_colors)
         self._apply_windows_titlebar_mode(self)
         self._apply_app_icon()
+        # Every readonly ttk.Combobox in the app (there are a couple
+        # dozen -- the Bot/Streamer identity switch, theme picker,
+        # permission dropdowns, etc.) shares one Tkinter quirk: picking
+        # an item leaves it showing a solid accent-colored "selected"
+        # fill across the whole field, and nothing ever clears it, so
+        # it just sits there looking stuck highlighted -- exactly what
+        # Ryan's screenshot of the Console tab's identity switch showed.
+        # Binding once here at the ttk widget-class level (rather than
+        # on each Combobox individually) clears it everywhere a pick
+        # happens, app-wide, including any added later.
+        self.bind_class("TCombobox", "<<ComboboxSelected>>", self._on_any_combobox_selected)
 
         self._event_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+
+        # See _drain_queue's "status" handling and _show_disconnect_alert
+        # -- tracks whether the bot was connected as of the last status
+        # event, so a connected->disconnected transition can be told
+        # apart from every other status line, and whether the disconnect
+        # about to happen was one Ryan (or LCBot itself) already
+        # confirmed, so the alert doesn't fire for a disconnect that was
+        # never a surprise in the first place.
+        self._was_connected = False
+        self._expected_disconnect = False
+        self._disconnect_alert_win: Optional[tk.Toplevel] = None
 
         self.bot = Bot(
             config, db,
@@ -151,6 +209,20 @@ class MainWindow(tk.Tk):
         except Exception:
             pass  # never let a titlebar cosmetic fail startup / a popup open
 
+    def _on_any_combobox_selected(self, event=None) -> None:
+        """See the bind_class(...) call in __init__ -- clears the
+        picked-item highlight fill every readonly ttk.Combobox leaves
+        behind after a selection. selection_clear() raises if nothing
+        is actually selected (harmless, just means there was nothing
+        to clear), so this stays a no-op rather than an error either
+        way."""
+        if event is None:
+            return
+        try:
+            event.widget.selection_clear()
+        except tk.TclError:
+            pass
+
     def _apply_app_icon(self) -> None:
         """Sets the window/taskbar icon from assets/icon.ico if that
         file exists next to the app. Safe no-op if it doesn't -- so
@@ -204,19 +276,136 @@ class MainWindow(tk.Tk):
         has no visible console) rather than staying silent if the file
         genuinely isn't found or Tk rejects it, so a future taskbar/
         titlebar icon report has something to check instead of pure
-        guesswork."""
+        guesswork.
+
+        Also logs an explicit success line for each call, not just
+        failures (2026-09-06): a live report of the taskbar reverting
+        to Tk's stock feather icon came back with *nothing* in
+        lcbot.log about it either way, which left no way to tell
+        whether that meant "the file wasn't found" (already logged),
+        "Tk rejected it" (already logged), or "everything here
+        reported success and Windows just isn't showing it" (which
+        wasn't logged at all, so looked identical to total silence).
+        Confirmed via Tk/PyInstaller research that Windows' own icon
+        cache is documented to be aggressive about this specifically --
+        see pythonguis.com's PyInstaller icon FAQ -- so a run where
+        both calls below log success is real evidence pointing at
+        Windows' shell/taskbar icon cache rather than this code."""
         icon_path = os.path.join(app_dir(), "assets", "icon.ico")
         if not os.path.exists(icon_path):
             logger.warning("app icon not found at %s -- taskbar/titlebar will use Tk's default icon", icon_path)
             return
         try:
             self.iconbitmap(icon_path)
+            logger.info("applied window-specific app icon from %s", icon_path)
         except tk.TclError:
             logger.exception("Tk rejected the app icon (window-specific form) at %s", icon_path)
         try:
             self.iconbitmap(default=icon_path)
+            logger.info("applied default-for-popups app icon from %s", icon_path)
         except tk.TclError:
             logger.exception("Tk rejected the app icon (default-for-popups form) at %s", icon_path)
+        self._force_taskbar_icon_win32(icon_path)
+
+    def _force_taskbar_icon_win32(self, icon_path: str) -> None:
+        """Round 7 (2026-09-07): Ryan reported the taskbar STILL showing
+        Tk's stock feather icon even after both iconbitmap() calls above
+        kept logging clean success AND after confirming (by pulling
+        assets/icon.ico off his actual machine and parsing its real
+        byte structure) that the file on disk genuinely is a proper
+        multi-resolution 16/24/32/48/64/128/256 classic-BMP .ico, and
+        that lcbot.log's timestamps show that exact fixed file was
+        already in place before the failing launch. That rules out
+        both "the call is throwing" and "the file is missing a size
+        Windows needs" -- the two theories from rounds 5 and 6 -- so
+        this isn't a guess at a third variation on either of those.
+
+        What's left is a real, separately-documented Tk-on-Windows
+        split: iconbitmap()/WM_SETICON change what a window itself
+        reports its icon as (title bar, Alt+Tab), but the taskbar
+        button can fall back to the *window class*'s icon instead --
+        and every Tk toplevel in a process shares ONE registered
+        window class, with Tk's own default (the feather) baked in as
+        that class's icon. iconbitmap() only ever touches the
+        per-window icon, never the class one, which matches Ryan's
+        symptom exactly (a stock icon specifically in the taskbar).
+
+        This calls the Win32 API directly to set the icon on both the
+        per-window (WM_SETICON) *and* window-class (SetClassLongPtrW)
+        levels -- belt and suspenders -- using LoadImageW to pull real
+        HICONs sized to what Windows' own GetSystemMetrics says the
+        big/small icon slots need, the same technique other Tk/Win32
+        apps use to work around this. Every failure is logged with
+        GetLastError() so if this *still* doesn't fix it, the next
+        round has actual data (which call failed, and why) instead of
+        another guess."""
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            user32 = ctypes.windll.user32
+            user32.LoadImageW.restype = ctypes.c_void_p
+            user32.LoadImageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SendMessageW.restype = ctypes.c_void_p
+            user32.SendMessageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p,
+            ]
+            user32.SetClassLongPtrW.restype = ctypes.c_void_p
+            user32.SetClassLongPtrW.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+            ]
+
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x00000010
+            LR_DEFAULTSIZE = 0x00000040
+            WM_SETICON = 0x0080
+            ICON_BIG = 1
+            ICON_SMALL = 0
+            GCLP_HICON = -14
+            GCLP_HICONSM = -34
+            SM_CXSMICON = 49
+            SM_CYSMICON = 50
+
+            # Big icon: let Windows pick its own default big-icon size
+            # (GetSystemMetrics(SM_CXICON)/(SM_CYICON) under the hood --
+            # respects the user's display scaling/accessibility "make
+            # icons bigger" setting rather than hardcoding 32).
+            hicon_big = user32.LoadImageW(
+                None, icon_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE
+            )
+            # Small icon: ask for the exact small-icon size Windows
+            # reports so LoadImageW picks the closest frame actually
+            # packed into the .ico (our file has a real 16x16 entry
+            # now) instead of scaling the big one down.
+            small_cx = user32.GetSystemMetrics(SM_CXSMICON)
+            small_cy = user32.GetSystemMetrics(SM_CYSMICON)
+            hicon_small = user32.LoadImageW(
+                None, icon_path, IMAGE_ICON, small_cx, small_cy, LR_LOADFROMFILE
+            )
+
+            if not hicon_big and not hicon_small:
+                logger.warning(
+                    "win32 LoadImageW returned NULL for both icon sizes from %s (GetLastError=%s)",
+                    icon_path, ctypes.GetLastError(),
+                )
+                return
+
+            if hicon_big:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+                user32.SetClassLongPtrW(hwnd, GCLP_HICON, hicon_big)
+            if hicon_small:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+                user32.SetClassLongPtrW(hwnd, GCLP_HICONSM, hicon_small)
+            logger.info(
+                "win32 force-set taskbar/window-class icon from %s (big=%s small=%s)",
+                icon_path, bool(hicon_big), bool(hicon_small),
+            )
+        except Exception:
+            logger.exception("win32 taskbar icon force-set failed")
 
     # -- toolbar ---------------------------------------------------------
     def _build_toolbar(self) -> None:
@@ -253,7 +442,7 @@ class MainWindow(tk.Tk):
     def _show_about(self) -> None:
         messagebox.showinfo(
             "About",
-            f"Twitch Chat Bot v{__version__}\n\n"
+            f"LCBot v{__version__}\n\n"
             "A self-hosted bot in the spirit of the original AnkhBot, "
             "before it became Streamlabs Chatbot. No cloud account, "
             "no subscription -- everything runs and is stored locally.",
@@ -311,8 +500,19 @@ class MainWindow(tk.Tk):
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=6)
         top.pack(fill="x")
-        self.connect_btn = ttk.Button(top, text="Connect", command=self._toggle_connect)
-        self.connect_btn.pack(side="left")
+        # The Connect/Disconnect button itself used to live right here,
+        # visible (and clickable) from every tab -- moved to the
+        # Settings tab's Connection section (2026-09-09) after Ryan
+        # accidentally clicked it mid-stream and didn't realize he'd
+        # disconnected until well after he'd missed real chat messages.
+        # Living only in Settings means an accidental click needs you
+        # to have deliberately navigated there first; see
+        # _build_settings_tab / _toggle_connect for the button itself
+        # and the confirm-before-disconnecting guard, and
+        # _show_disconnect_alert for the "so I actually notice" half of
+        # that fix. The status label stays here (and is mirrored in
+        # Settings) since just *seeing* the state from any tab is
+        # useful and can't be clicked by accident.
         self.status_label = ttk.Label(top, text="Disconnected", style="Muted.TLabel")
         self.status_label.pack(side="left", padx=10)
         # Live viewer count, shown right next to the "Joined #channel"
@@ -420,10 +620,21 @@ class MainWindow(tk.Tk):
         # connection; "Streamer" posts via the Helix Chat API using the
         # broadcaster's own authorized token instead.
         self.send_identity_var = tk.StringVar(value="Bot")
-        ttk.Combobox(
+        self.send_identity_combo = ttk.Combobox(
             send_frame, textvariable=self.send_identity_var, state="readonly", width=8,
             values=["Bot", "Streamer"],
-        ).pack(side="left", padx=(0, 4))
+        )
+        self.send_identity_combo.pack(side="left", padx=(0, 4))
+        # A readonly ttk.Combobox leaves its just-picked value showing
+        # a solid accent-colored selection fill across the whole field
+        # after every choice -- a well-known Tkinter quirk, not
+        # anything specific to this dropdown -- and nothing else in
+        # this row ever takes that text selection away, so it just
+        # sits there looking "stuck" highlighted (exactly what Ryan's
+        # screenshot showed). Clearing it right after a pick, and
+        # handing focus to the message box (where you're about to type
+        # next anyway), gets rid of it immediately.
+        self.send_identity_combo.bind("<<ComboboxSelected>>", self._on_send_identity_selected)
 
         self.send_entry = ttk.Entry(send_frame)
         self.send_entry.pack(side="left", fill="x", expand=True)
@@ -432,12 +643,21 @@ class MainWindow(tk.Tk):
 
         self.chat_log.pack(side="top", fill="both", expand=True, padx=8, pady=8)
 
+    def _on_send_identity_selected(self, event=None) -> None:
+        """The stuck-highlight fill itself is cleared app-wide by the
+        bind_class(...) handler in __init__ (_on_any_combobox_selected)
+        -- this is just the one extra, dropdown-specific touch: after
+        picking Bot/Streamer you're almost always about to type a
+        message, so hand focus straight to the entry box instead of
+        leaving it sitting on the combobox."""
+        self.send_entry.focus_set()
+
     def _append_log(self, text: str, tag: str = "system") -> None:
         """For system/status lines and the bot's own outgoing echo --
         anything that isn't a live chat message from a viewer (those go
         through _append_chat_message instead, for badges/emotes)."""
         self.chat_log.configure(state="normal")
-        self.chat_log.insert("end", text + "\n", (tag,))
+        self._insert_with_emoji_fallback(text + "\n", (tag,))
         self.chat_log.see("end")
         self.chat_log.configure(state="disabled")
 
@@ -445,9 +665,33 @@ class MainWindow(tk.Tk):
         self.chat_log.configure(state="normal")
         self.chat_log.insert("end", f"[{time.strftime('%H:%M:%S')}] ", ("timestamp",))
         self.chat_log.insert("end", f"{prefix}: ", ("outgoing_prefix",))
-        self.chat_log.insert("end", text + "\n")
+        self._insert_with_emoji_fallback(text + "\n")
         self.chat_log.see("end")
         self.chat_log.configure(state="disabled")
+
+    def _insert_with_emoji_fallback(self, text: str, base_tags: tuple = ()) -> None:
+        """Inserts text into the chat log, splitting it into runs so any
+        character in a known emoji/symbol/dingbat range (see
+        _needs_emoji_font) gets the explicit "emoji_fallback" tag
+        (Segoe UI Emoji) instead of whatever tofu box Tk's own
+        inconsistent Windows font-fallback would otherwise show.
+        Used everywhere text LCBot doesn't control end up in the chat
+        log -- a viewer's message, WizeBot's or another bot's own
+        messages, an editable alert template -- since any of that can
+        contain characters Segoe UI itself can't render."""
+        if not text:
+            return
+        run_start = 0
+        run_is_emoji = _needs_emoji_font(text[0])
+        for i in range(1, len(text)):
+            this_is_emoji = _needs_emoji_font(text[i])
+            if this_is_emoji != run_is_emoji:
+                tags = base_tags + (("emoji_fallback",) if run_is_emoji else ())
+                self.chat_log.insert("end", text[run_start:i], tags)
+                run_start = i
+                run_is_emoji = this_is_emoji
+        tags = base_tags + (("emoji_fallback",) if run_is_emoji else ())
+        self.chat_log.insert("end", text[run_start:], tags)
 
     def _username_tag(self, color: str) -> str:
         """A per-user Text tag colored to match Twitch's own username
@@ -470,8 +714,13 @@ class MainWindow(tk.Tk):
         """Renders a live chat line with inline chat badges and Twitch
         emotes, instead of raw text -- badge, emote, and username-color
         ids all come straight off the IRC tags Twitch already sends (see
-        irc_client.py), no extra API calls needed per message."""
+        irc_client.py), no extra API calls needed per message. Also
+        applies "hanging_indent" (see _configure_chat_log_tags) over
+        the whole line once it's built, so a wrapped line indents under
+        the message text like real Twitch/Discord/Streamlabs chat
+        instead of wrapping back to the left edge."""
         self.chat_log.configure(state="normal")
+        line_start = self.chat_log.index("end-1c")
         self.chat_log.insert("end", f"[{time.strftime('%H:%M:%S')}] ", ("timestamp",))
 
         for badge_spec in (msg.tags.get("badges") or "").split(","):
@@ -487,6 +736,7 @@ class MainWindow(tk.Tk):
         click_tag = self._user_click_tag(msg.username, msg.display_name)
         self.chat_log.insert("end", f"{msg.display_name}: ", (username_tag, click_tag))
         self._insert_message_with_emotes(msg.text, msg.tags.get("emotes", ""))
+        self.chat_log.tag_add("hanging_indent", line_start, "end-1c")
         self.chat_log.insert("end", "\n")
         self.chat_log.see("end")
         self.chat_log.configure(state="disabled")
@@ -515,13 +765,13 @@ class MainWindow(tk.Tk):
 
     def _show_user_menu(self, event: tk.Event, username: str, display_name: str) -> None:
         """The click-a-name popup: view recent messages, timeout/ban/
-        unban. Moderation actions reuse the same "/timeout"/"/ban"/
-        "/unban" chat commands the Moderation tab's auto-enforcement
-        already sends (see Bot._apply_moderation) -- sent as the "Bot"
-        identity, over the bot's own connection, same as any other
-        chat command, so they need the bot account to actually be
-        modded in the channel to take effect (same requirement the
-        existing moderation system already has)."""
+        unban. Moderation actions go through the same Helix Moderation
+        API calls the auto-enforcement filters use (see
+        Bot.timeout_user/ban_user/unban_user in core/bot.py) -- Twitch
+        retired the old /timeout, /ban, /unban IRC chat commands, so
+        these need the bot account logged in with the moderator scopes
+        and actually modded in the channel to take effect (same
+        requirement the existing moderation system already has)."""
         menu = tk.Menu(self, tearoff=0, **theme.popup_menu_kwargs())
         menu.add_command(label=f"@{display_name}", state="disabled")
         menu.add_separator()
@@ -541,7 +791,11 @@ class MainWindow(tk.Tk):
             menu.grab_release()
 
     def _timeout_user(self, username: str, seconds: int) -> None:
-        self.bot.send_chat(f"/timeout {username} {seconds}")
+        self._run_mod_action(
+            lambda: self.bot.timeout_user(username, seconds),
+            f"Timed out @{username} for {seconds}s.",
+            f"Couldn't time out @{username} -- is the bot logged in and modded in the channel?",
+        )
 
     def _timeout_user_custom(self, username: str) -> None:
         seconds = simpledialog.askinteger(
@@ -552,10 +806,33 @@ class MainWindow(tk.Tk):
 
     def _ban_user(self, username: str, display_name: str) -> None:
         if messagebox.askyesno("Ban", f"Ban @{display_name}? This can be undone with Unban."):
-            self.bot.send_chat(f"/ban {username}")
+            self._run_mod_action(
+                lambda: self.bot.ban_user(username),
+                f"Banned @{username}.",
+                f"Couldn't ban @{username} -- is the bot logged in and modded in the channel?",
+            )
 
     def _unban_user(self, username: str) -> None:
-        self.bot.send_chat(f"/unban {username}")
+        self._run_mod_action(
+            lambda: self.bot.unban_user(username),
+            f"Unbanned @{username}.",
+            f"Couldn't unban @{username} (they may not be banned, or the bot isn't logged in/modded).",
+        )
+
+    def _run_mod_action(self, action: Callable[[], bool], success_text: str, failure_text: str) -> None:
+        """Runs a Bot.timeout_user/ban_user/unban_user call off the GUI
+        thread -- these are now real Helix HTTP requests (replacing the
+        old instant, fire-and-forget /timeout /ban /unban IRC chat
+        commands), so they can take a moment and must not freeze the
+        window while they do."""
+        def worker():
+            try:
+                ok = action()
+            except Exception:
+                logger.exception("moderation action failed")
+                ok = False
+            self._event_queue.put(("mod_action_result", (ok, success_text, failure_text)))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _show_user_messages_dialog(self, username: str, display_name: str) -> None:
         rows = self.db.get_recent_messages(username, limit=50)
@@ -597,15 +874,15 @@ class MainWindow(tk.Tk):
             if start < pos or start >= len(text) or end < start:
                 continue  # overlapping/out-of-range -- skip rather than corrupt the line
             if start > pos:
-                self.chat_log.insert("end", text[pos:start])
+                self._insert_with_emoji_fallback(text[pos:start])
             image = self.emote_cache.get_emote_image(emote_id)
             if image is not None:
                 self.chat_log.image_create("end", image=image)
             else:
-                self.chat_log.insert("end", text[start:end + 1])
+                self._insert_with_emoji_fallback(text[start:end + 1])
             pos = end + 1
         if pos < len(text):
-            self.chat_log.insert("end", text[pos:])
+            self._insert_with_emoji_fallback(text[pos:])
 
     def _send_manual_message(self) -> None:
         text = self.send_entry.get().strip()
@@ -639,6 +916,25 @@ class MainWindow(tk.Tk):
         self.chat_log.tag_configure(
             "outgoing_prefix", foreground=theme.ACCENT, font=(CHAT_FONT_FAMILY, CHAT_FONT_SIZE, "bold")
         )
+        # See _insert_with_emoji_fallback -- configured last so it wins
+        # tag-priority ties over "system"/"outgoing_prefix" for the
+        # specific run it's applied to (Tk gives later-configured tags
+        # higher priority by default); losing e.g. the italic on one
+        # emoji character within a system line is a fine trade for that
+        # character actually being visible at all.
+        self.chat_log.tag_configure("emoji_fallback", font=(EMOJI_FONT_FAMILY, CHAT_FONT_SIZE))
+        # Real Twitch/Discord/Streamlabs chat widgets hang-indent a
+        # wrapped message so the continuation lines align under where
+        # the message text itself starts, instead of wrapping all the
+        # way back to the left edge under the timestamp -- asked for
+        # (2026-09-09) as part of making the Console tab look more like
+        # real Twitch/Streamlabs chat. The exact indent varies with how
+        # many badges a given line has, which Tk's paragraph-level
+        # lmargin options can't do per-line -- this uses one fixed
+        # approximation (roughly a timestamp + one badge + a short
+        # username) rather than the precise-but-impossible-in-Tk exact
+        # alignment every line would need.
+        self.chat_log.tag_configure("hanging_indent", lmargin1=0, lmargin2=64)
 
     # -- dashboard (quick stats) ---------------------------------------
     def _build_dashboard_tab(self) -> None:
@@ -695,7 +991,7 @@ class MainWindow(tk.Tk):
         self._game_search_after_id: Optional[str] = None
 
         self.dash_refresh_btn = ttk.Button(
-            box, text="↻", width=3, command=self._refresh_stream_info_fields,
+            box, text="↻", width=3, style="Icon.TButton", command=self._refresh_stream_info_fields,
         )
         self.dash_refresh_btn.grid(row=0, column=0, padx=(0, 8))
 
@@ -709,7 +1005,7 @@ class MainWindow(tk.Tk):
         self.dash_game_combo.bind("<KeyRelease>", self._on_dashboard_game_typed)
 
         self.dash_save_btn = ttk.Button(
-            box, text="↑", width=3, command=self._save_stream_info_from_dashboard,
+            box, text="↑", width=3, style="Icon.TButton", command=self._save_stream_info_from_dashboard,
         )
         self.dash_save_btn.grid(row=0, column=5, padx=(8, 0))
 
@@ -719,10 +1015,24 @@ class MainWindow(tk.Tk):
         if self.bot.twitch_api is not None:
             self._refresh_stream_info_fields()
         else:
-            self.dash_title_var.set("[NONE]")
-            self.dash_game_var.set("[NONE]")
+            # No live Twitch connection yet (app just launched, or the
+            # broadcaster isn't authorized) -- show whatever we last
+            # actually saw from Twitch instead of a bare "[NONE]", so
+            # the box has real information immediately rather than
+            # only after a manual refresh. Gets overwritten the moment
+            # a live fetch succeeds (on Connect, or a manual refresh).
+            cached_title = self.db.get_setting("dashboard_last_title", "") or ""
+            cached_game = self.db.get_setting("dashboard_last_game_name", "") or ""
+            cached_game_id = self.db.get_setting("dashboard_last_game_id", "") or ""
+            self.dash_title_var.set(cached_title or "[NONE]")
+            self.dash_game_var.set(cached_game or "[NONE]")
+            if cached_game and cached_game_id:
+                self._dash_game_options[cached_game.lower()] = cached_game_id
+                self.dash_game_combo.configure(values=[cached_game])
             self.dash_stream_info_status.configure(
                 text='Authorize the broadcaster in Settings to load/edit this.'
+                if not (cached_title or cached_game) else
+                "Showing last-known title/game -- authorize the broadcaster in Settings to refresh/edit."
             )
 
     def _refresh_stream_info_fields(self) -> None:
@@ -1053,6 +1363,7 @@ class MainWindow(tk.Tk):
             ("moderation_symbols_threshold_pct", "Symbol % that triggers"),
             ("moderation_strikes_before_timeout", "Strikes before timeout"),
             ("moderation_timeout_seconds", "Timeout length (s)"),
+            ("moderation_permit_seconds", "!permit exemption length (s)"),
         ]
         for i, (key, label) in enumerate(int_fields):
             ttk.Label(thresholds, text=label).grid(row=i, column=0, sticky="w", pady=2)
@@ -1728,6 +2039,16 @@ class MainWindow(tk.Tk):
         )
         r += 1
 
+        # Connect/Disconnect lives here (not on the always-visible top
+        # bar -- see _build_ui's comment) specifically so it can't be
+        # clicked by accident while live. self._toggle_connect still
+        # confirms before actually disconnecting on top of that.
+        self.settings_connect_btn = ttk.Button(frame, text="Connect", command=self._toggle_connect)
+        self.settings_connect_btn.grid(row=r, column=0, sticky="w", pady=(4, 12))
+        self.settings_status_label = ttk.Label(frame, text="Disconnected", style="Muted.TLabel")
+        self.settings_status_label.grid(row=r, column=1, sticky="w", padx=8, pady=(4, 12))
+        r += 1
+
         ttk.Label(
             frame, text="Streamer account (stream info, alerts, title/game updates)", style="Heading.TLabel"
         ).grid(row=r, column=0, sticky="w", pady=(12, 4))
@@ -1762,10 +2083,21 @@ class MainWindow(tk.Tk):
             row=r, column=2, padx=6
         )
         r += 1
-        row("Went-live message", "discord_went_live_message", r=r); r += 1
+        row("Went-live message", "discord_went_live_message", r=r)
+        ttk.Button(frame, text="Send now (backup)", command=self._send_real_discord_announcement).grid(
+            row=r, column=2, padx=6
+        )
+        r += 1
         ttk.Label(
             frame, text="Placeholders: {channel} {title} {game}", style="Muted.TLabel"
         ).grid(row=r, column=1, sticky="w", padx=8)
+        r += 1
+        ttk.Label(
+            frame,
+            text="\"Send now\" posts the real went-live message immediately (with live title/game "
+                 "filled in) -- a manual backup if the automatic announcement doesn't fire.",
+            style="Muted.TLabel", justify="left", wraplength=420,
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
 
         self.discord_enabled_var = tk.BooleanVar(value=cfg.discord_announce_enabled)
@@ -1791,7 +2123,8 @@ class MainWindow(tk.Tk):
         r += 1
         self.alerts_enabled_var = tk.BooleanVar(value=self.db.get_setting_bool("alerts_enabled", True))
         ttk.Checkbutton(
-            frame, text="Announce follows, subs, and raids in chat", variable=self.alerts_enabled_var
+            frame, text="Announce follows, subs, raids, and title/game changes in chat",
+            variable=self.alerts_enabled_var,
         ).grid(row=r, column=0, sticky="w")
         r += 1
 
@@ -1828,6 +2161,16 @@ class MainWindow(tk.Tk):
         ttk.Checkbutton(frame, text="Raids", variable=raid_var).grid(row=r, column=0, sticky="w")
         r += 1
         template_row("Message:", "alerts_raid_message", "{user} {viewers}")
+
+        title_game_var = tk.BooleanVar(value=self.db.get_setting_bool("alerts_title_game_enabled", True))
+        self.alerts_type_vars["alerts_title_game_enabled"] = title_game_var
+        ttk.Checkbutton(
+            frame, text="Title/game changes (while live)", variable=title_game_var
+        ).grid(row=r, column=0, sticky="w")
+        r += 1
+        template_row("Title changed:", "alerts_title_changed_message", "{title}")
+        template_row("Game changed:", "alerts_game_changed_message", "{game}")
+        template_row("Both changed:", "alerts_title_game_changed_message", "{title} {game}")
 
         # -- Backup & Restore --------------------------------------------
         ttk.Label(frame, text="Backup & Restore", style="Heading.TLabel").grid(
@@ -2211,6 +2554,7 @@ class MainWindow(tk.Tk):
             return
 
         if self.bot.connected:
+            self._expected_disconnect = True
             self.bot.disconnect()
         db_path = self.db.path
         self.db.close()
@@ -2260,6 +2604,61 @@ class MainWindow(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _send_real_discord_announcement(self) -> None:
+        """Manual backup for the automatic went-live announcement,
+        added 2026-09-22 after a report of the automatic one not
+        firing during a real stream. Unlike "Send test message" above
+        (which just posts a fixed sentence to prove the webhook
+        works), this sends the *real* went-live message template with
+        the actual current title/game filled in, bypassing tick()'s
+        own timing/dedup check entirely -- a manual "just post it"
+        fallback a streamer can hit by hand. Still marks the current
+        broadcast as announced afterward (see
+        DiscordNotifier.record_announced_broadcast) so the automatic
+        check doesn't also post a duplicate once it next ticks."""
+        url = self.settings_vars["discord_webhook_url"].get().strip()
+        if not url:
+            messagebox.showerror(
+                "Discord", "Please check your Discord webhook URL in Settings -- it's empty."
+            )
+            return
+        template = self.settings_vars["discord_went_live_message"].get().strip()
+        if not template:
+            messagebox.showerror(
+                "Discord", "The went-live message is empty -- add one above first."
+            )
+            return
+        channel = self.settings_vars["channel"].get().strip().lower()
+        twitch_api = self.bot.twitch_api
+
+        def worker():
+            info = StreamInfo(live=True)
+            fetch_note = None
+            if twitch_api and channel:
+                try:
+                    info = twitch_api.get_stream_info(channel)
+                except TwitchAPIError as exc:
+                    fetch_note = f"couldn't fetch live title/game from Twitch ({exc})"
+            elif not channel:
+                fetch_note = "no Twitch channel is set in Settings"
+            elif not twitch_api:
+                fetch_note = "the streamer account isn't authorized (Settings -> \"Log in with Twitch (streamer account)\")"
+            text = self.bot.discord.render(template, channel, info)
+            try:
+                self.bot.discord.send(url, text)
+                # Marks this broadcast as announced (2026-09-25) so the
+                # automatic check doesn't post a duplicate the next
+                # time it ticks and sees the same still-live stream --
+                # a no-op if info.started_at is None (fetch failed, or
+                # not authorized), same conservative behavior as the
+                # automatic path when it can't confirm what's live.
+                self.bot.discord.record_announced_broadcast(info.started_at)
+                self._event_queue.put(("discord_announce_result", (True, text, fetch_note)))
+            except Exception as exc:
+                self._event_queue.put(("discord_announce_result", (False, str(exc), fetch_note)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _authorize_chat(self) -> None:
         client_id = oauth.effective_client_id(self.settings_vars["client_id"].get())
         if not client_id:
@@ -2296,8 +2695,22 @@ class MainWindow(tk.Tk):
     # -- connect/disconnect -------------------------------------------
     def _toggle_connect(self) -> None:
         if self.bot.connected:
+            # Confirm on top of having already moved this button off
+            # the always-visible top bar (2026-09-09) -- Ryan clicked
+            # it by accident while live before and didn't notice he'd
+            # disconnected until he'd already missed real chat. Even
+            # tucked away in Settings, a stray click while going for
+            # something else nearby is still possible; this is the
+            # cheap second layer against that specific mistake.
+            if not messagebox.askyesno(
+                "Disconnect",
+                "Disconnect the bot from chat? It won't rejoin or see any "
+                "new messages until you connect again from here.",
+            ):
+                return
+            self._expected_disconnect = True
             self.bot.disconnect()
-            self.connect_btn.configure(text="Connect")
+            self.settings_connect_btn.configure(text="Connect")
         else:
             self._connect()
 
@@ -2314,10 +2727,71 @@ class MainWindow(tk.Tk):
         def worker():
             try:
                 self.bot.connect()
+                # Connecting is what actually gives us a usable
+                # twitch_api (see _build_dashboard_basic_section --
+                # before this, the Basic box can only show cached/
+                # "[NONE]" values). Pulling the real title/game the
+                # moment we're authorized is what Ryan asked for
+                # ("it needs to pull it from twitch upon the bot
+                # launching") instead of requiring a manual refresh
+                # click every time.
+                self._event_queue.put(("bot_connected", None))
             except Exception as exc:
                 self._event_queue.put(("connect_failed", exc))
         threading.Thread(target=worker, daemon=True).start()
-        self.connect_btn.configure(text="Disconnect")
+        self.settings_connect_btn.configure(text="Disconnect")
+
+    def _show_disconnect_alert(self, reason: str) -> None:
+        """A dropped or missed disconnect used to only ever show up as
+        one line scrolling by in the Console tab's chat log -- easy to
+        miss completely if you're not staring at that exact tab while
+        live, which is exactly what happened to Ryan (2026-09-09): an
+        accidental disconnect went unnoticed until he'd already missed
+        real chat messages. This pops up regardless of which tab is
+        open, stays open until dismissed rather than fading on its own,
+        and offers Reconnect right there instead of needing to go find
+        Settings and the button by hand. `-topmost` plus a fresh
+        Toplevel window is also what gets Windows to flash/highlight
+        the taskbar for it -- a plain label change on the existing
+        window wouldn't. A stray old alert (e.g. a second drop before
+        the first was dismissed) is replaced rather than stacking."""
+        if self._disconnect_alert_win is not None:
+            try:
+                self._disconnect_alert_win.destroy()
+            except Exception:
+                pass
+        win = self._toplevel("LCBot disconnected", "380x190")
+        win.resizable(False, False)
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self._disconnect_alert_win = win
+
+        def _close() -> None:
+            self._disconnect_alert_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _close)
+
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass  # cosmetic only -- never let a beep failure block the alert itself
+
+        ttk.Label(win, text="⚠ Disconnected from chat", style="Heading.TLabel").pack(padx=20, pady=(20, 6))
+        ttk.Label(win, text=reason, wraplength=340, justify="center", style="Muted.TLabel").pack(padx=20)
+        btn_row = ttk.Frame(win)
+        btn_row.pack(pady=16)
+
+        def _reconnect() -> None:
+            _close()
+            self.notebook.select(self.settings_tab)
+            self._connect()
+
+        ttk.Button(btn_row, text="Reconnect", command=_reconnect).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Dismiss", command=_close).pack(side="left", padx=6)
 
     # -- helpers -------------------------------------------------------
     def _toplevel(self, title: str, geometry: str) -> tk.Toplevel:
@@ -2378,16 +2852,45 @@ class MainWindow(tk.Tk):
                 elif kind == "status":
                     friendly = self._friendly_status_text(str(payload))
                     self.status_label.configure(text=friendly)
+                    self.settings_status_label.configure(text=friendly)
                     self._append_log(f"* {friendly}")
                     # The connection can also drop on its own (a bad
                     # token, a network hiccup) rather than through the
                     # Disconnect button -- keep the button's label
                     # matching what's actually happened either way.
-                    self.connect_btn.configure(text="Disconnect" if self.bot.connected else "Connect")
+                    now_connected = self.bot.connected
+                    self.settings_connect_btn.configure(text="Disconnect" if now_connected else "Connect")
+                    # Firing the "you've been disconnected" alert (see
+                    # _show_disconnect_alert) right here, off the one
+                    # place every disconnect -- deliberate or dropped --
+                    # already funnels through, covers both causes with
+                    # no separate wiring needed. Only on an actual
+                    # connected -> disconnected transition (not e.g. the
+                    # "Connected, joining #channel..." status during a
+                    # normal connect), and not for a disconnect Ryan
+                    # just confirmed himself (see _toggle_connect/
+                    # _expected_disconnect) or one LCBot triggers itself
+                    # (restoring a backup, closing the app).
+                    if self._was_connected and not now_connected:
+                        if self._expected_disconnect:
+                            self._expected_disconnect = False
+                        else:
+                            self._show_disconnect_alert(friendly)
+                    self._was_connected = now_connected
                 elif kind == "connect_failed":
                     exc = payload
-                    self.connect_btn.configure(text="Connect")
+                    self.settings_connect_btn.configure(text="Connect")
                     messagebox.showerror("Connect", friendly_error_text(exc))
+                elif kind == "bot_connected":
+                    self._was_connected = True
+                    self._refresh_stream_info_fields()
+                    # A fresh connect is the natural point to also
+                    # retry chat badges from scratch -- covers both a
+                    # reconnect after a transient badge-fetch failure
+                    # (see EmoteBadgeCache.reset's docstring) and
+                    # picking up new/changed badges after re-
+                    # authorizing with different scopes.
+                    self.emote_cache.reset()
                 elif kind == "outgoing":
                     text, identity = payload
                     self._append_outgoing(text, prefix=identity)
@@ -2415,6 +2918,15 @@ class MainWindow(tk.Tk):
                         messagebox.showinfo("Discord", "Test message sent -- check your Discord channel.")
                     else:
                         messagebox.showerror("Discord", friendly_error_text(err))
+                elif kind == "discord_announce_result":
+                    ok, text_or_err, fetch_note = payload
+                    if ok:
+                        msg = f"Announcement sent -- check your Discord channel.\n\n\"{text_or_err}\""
+                        if fetch_note:
+                            msg += f"\n\n(Note: {fetch_note}, so {{title}}/{{game}} may be blank above.)"
+                        messagebox.showinfo("Discord", msg)
+                    else:
+                        messagebox.showerror("Discord", friendly_error_text(text_or_err))
                 elif kind == "dashboard_stream_info_loaded":
                     info = payload
                     title = info.get("title", "") or ""
@@ -2425,6 +2937,16 @@ class MainWindow(tk.Tk):
                     if game_name and game_id:
                         self._dash_game_options[game_name.lower()] = game_id
                         self.dash_game_combo.configure(values=[game_name])
+                    if title or game_name:
+                        # Cache whatever we actually got so the next
+                        # launch (or the box in its pre-connect state)
+                        # can show real data instead of "[NONE]"
+                        # before a live fetch completes. Guarded so a
+                        # totally empty/errored fetch (see below) never
+                        # clobbers good cached values.
+                        self.db.set_setting("dashboard_last_title", title)
+                        self.db.set_setting("dashboard_last_game_name", game_name)
+                        self.db.set_setting("dashboard_last_game_id", game_id)
                     if not title and not game_name:
                         # Twitch's own API errors here get swallowed by
                         # Bot.get_channel_info() (it's only ever used to
@@ -2458,6 +2980,13 @@ class MainWindow(tk.Tk):
                         self._flash_saved(self.dash_stream_info_status, "Saved!")
                     else:
                         self.dash_stream_info_status.configure(text=friendly_error_text(err))
+                elif kind == "mod_action_result":
+                    ok, success_text, failure_text = payload
+                    if ok:
+                        self._append_log(f"* {success_text}")
+                    else:
+                        self._append_log(f"* {failure_text}")
+                        messagebox.showerror("Moderation", failure_text)
         except queue.Empty:
             pass
         self.after(POLL_MS, self._drain_queue)
@@ -2474,6 +3003,7 @@ class MainWindow(tk.Tk):
 
     def _on_close(self) -> None:
         try:
+            self._expected_disconnect = True
             self.bot.disconnect()
         finally:
             if self._overlay_server is not None:

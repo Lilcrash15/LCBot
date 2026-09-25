@@ -2,10 +2,20 @@
 
 Used for the stuff Twitch IRC doesn't tell you: follower counts,
 follow dates, stream uptime/title/game. Requires a Client-ID (from a
-registered Twitch Dev Console app) and a user access token with at
-least no special scopes for public read endpoints -- moderation
-actions elsewhere in the app use IRC commands (/timeout, /ban) instead
-of the API, so no extra scopes are required just to run the bot.
+registered Twitch Dev Console app) and a user access token -- public
+read endpoints need no special scopes, but the moderation methods
+below (ban_user/unban_user/delete_chat_message) do.
+
+Moderation used to be done by sending /timeout, /ban, /delete, /unban
+as plain IRC chat messages -- that's how Twitch chat moderation always
+worked, until Twitch quietly retired it. IRC now just replies
+"Unrecognized command: /ban" etc. for all of them, so moderation has
+to go through this Helix API instead (scopes moderator:manage:
+banned_users and moderator:manage:chat_messages, added to CHAT_SCOPES
+in core/oauth.py since it's the *bot* account's token that needs to
+own these calls -- Twitch requires moderator_id to be the token
+owner, and the bot, not the streamer, is the one actually modded in
+the channel).
 """
 from __future__ import annotations
 
@@ -215,6 +225,73 @@ class TwitchAPI:
             return []
         data = self._get("/channels/followers", {"broadcaster_id": broadcaster_id, "first": first})
         return list(data.get("data", []))
+
+    def ban_user(
+        self, broadcaster_id: str, moderator_id: str, user_id: str,
+        duration: Optional[int] = None, reason: str = "",
+    ) -> None:
+        """Bans (duration left out) or times out (duration=seconds, up to
+        1209600 = 2 weeks) a user -- the Helix replacement for the now-
+        defunct /ban and /timeout IRC commands. moderator_id must be the
+        user ID of the token's own owner, and that account must actually
+        be a moderator (or the broadcaster) in this channel. Scope
+        moderator:manage:banned_users."""
+        url = (
+            f"{HELIX_BASE}/moderation/bans?broadcaster_id={urllib.parse.quote(broadcaster_id)}"
+            f"&moderator_id={urllib.parse.quote(moderator_id)}"
+        )
+        data: dict = {"user_id": user_id}
+        if duration is not None:
+            data["duration"] = duration
+        if reason:
+            data["reason"] = reason[:500]  # Twitch caps the reason at 500 chars
+        payload = json.dumps({"data": data}).encode("utf-8")
+        headers = self._headers()
+        headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise TwitchAPIError(f"Helix ban/timeout failed: {exc.code} {body}") from exc
+        except urllib.error.URLError as exc:
+            raise TwitchAPIError(f"Helix ban/timeout unreachable: {exc}") from exc
+
+    def unban_user(self, broadcaster_id: str, moderator_id: str, user_id: str) -> None:
+        """Lifts a ban or timeout -- the Helix replacement for the now-
+        defunct /unban IRC command. Scope moderator:manage:banned_users."""
+        url = (
+            f"{HELIX_BASE}/moderation/bans?broadcaster_id={urllib.parse.quote(broadcaster_id)}"
+            f"&moderator_id={urllib.parse.quote(moderator_id)}&user_id={urllib.parse.quote(user_id)}"
+        )
+        req = urllib.request.Request(url, headers=self._headers(), method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise TwitchAPIError(f"Helix unban failed: {exc.code} {body}") from exc
+        except urllib.error.URLError as exc:
+            raise TwitchAPIError(f"Helix unban unreachable: {exc}") from exc
+
+    def delete_chat_message(self, broadcaster_id: str, moderator_id: str, message_id: str) -> None:
+        """Deletes a single chat message -- the Helix replacement for the
+        now-defunct /delete IRC command. Scope
+        moderator:manage:chat_messages."""
+        url = (
+            f"{HELIX_BASE}/moderation/chat?broadcaster_id={urllib.parse.quote(broadcaster_id)}"
+            f"&moderator_id={urllib.parse.quote(moderator_id)}&message_id={urllib.parse.quote(message_id)}"
+        )
+        req = urllib.request.Request(url, headers=self._headers(), method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise TwitchAPIError(f"Helix delete message failed: {exc.code} {body}") from exc
+        except urllib.error.URLError as exc:
+            raise TwitchAPIError(f"Helix delete message unreachable: {exc}") from exc
 
     def get_follow_info(self, broadcaster_login: str, user_login: str) -> Optional[dict]:
         """Returns {'followed_at': iso8601 str} or None if not following.

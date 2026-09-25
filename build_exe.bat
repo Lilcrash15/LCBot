@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo === Twitch Chat Bot: build .exe ===
+echo === LCBot: build .exe ===
 echo Folder: %cd%
 echo.
 

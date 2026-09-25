@@ -15,6 +15,15 @@ All four alert types (and the bot as a whole) can be turned off from
 Settings, and every message is an editable template stored in the
 settings table (see database.py's DEFAULT_SETTINGS), same as the
 Discord went-live message.
+
+A fifth type, title/game-change announcements, is diff-based rather
+than event-driven: Twitch doesn't push a chat event for either one, so
+check_stream_info() is fed the same StreamInfo snapshot Bot already
+refreshes every scheduler tick (see Bot._refresh_stream_info) and
+compares it against the last snapshot seen. Being diff-based (rather
+than hooked only into the app's own "Save" button on the Dashboard) is
+deliberate -- it catches a title/game change made from Twitch's own
+dashboard or mobile app just as well as one made from LCBot itself.
 """
 from __future__ import annotations
 
@@ -23,7 +32,7 @@ import time
 from typing import Optional
 
 from chatbot.core.database import Database
-from chatbot.modules.twitch_api import TwitchAPI, TwitchAPIError
+from chatbot.modules.twitch_api import StreamInfo, TwitchAPI, TwitchAPIError
 
 logger = logging.getLogger("chatbot.alerts")
 
@@ -45,6 +54,12 @@ class AlertsModule:
         # the false-announce bug DiscordNotifier.reset() avoids for
         # went-live.
         self._known_follower_ids: Optional[set] = None
+        # Same None-baseline idea as _known_follower_ids above, for the
+        # exact same reason: without it, the very first live check
+        # after connecting would compare against nothing and "announce"
+        # whatever the title/game already happened to be.
+        self._known_title: Optional[str] = None
+        self._known_game: Optional[str] = None
 
     def reset_session(self) -> None:
         """Called from Bot.connect() so each connection re-establishes
@@ -52,6 +67,8 @@ class AlertsModule:
         reconnect or app relaunch."""
         self._last_follower_check = 0.0
         self._known_follower_ids = None
+        self._known_title = None
+        self._known_game = None
 
     # -- USERNOTICE: sub / resub / subgift / raid (event-driven) --------
     def handle_usernotice(self, tags: dict) -> Optional[str]:
@@ -124,6 +141,44 @@ class AlertsModule:
             self._render("alerts_follow_message", user=f.get("user_name") or f.get("user_login", "someone"))
             for f in reversed(new_ones)
         ]
+
+    # -- title/game change (diff-based, fed from the 10s scheduler tick) --
+    def check_stream_info(self, info: Optional[StreamInfo]) -> list:
+        """Returns zero or more chat messages for a title and/or game
+        change since the last time this was called. Only diffs while
+        live: get_stream_info() (the /streams endpoint) comes back with
+        blank title/game_name whenever the channel is offline, which
+        would otherwise look like a "change to blank" the moment a
+        stream ends and a "change back" the moment it starts again.
+        Covers a title change, a game change, or both together in one
+        call with a single combined message, same as a real streamer
+        who updates both at once when starting a new segment."""
+        if info is None or not info.live:
+            return []
+        if not self.db.get_setting_bool("alerts_enabled", True):
+            return []
+        if not self.db.get_setting_bool("alerts_title_game_enabled", True):
+            return []
+
+        if self._known_title is None:
+            # First live check this session -- record where things
+            # stand without announcing it (see _known_title's comment).
+            self._known_title = info.title
+            self._known_game = info.game_name
+            return []
+
+        title_changed = info.title != self._known_title
+        game_changed = info.game_name != self._known_game
+        self._known_title = info.title
+        self._known_game = info.game_name
+
+        if not title_changed and not game_changed:
+            return []
+        if title_changed and game_changed:
+            return [self._render("alerts_title_game_changed_message", title=info.title, game=info.game_name)]
+        if game_changed:
+            return [self._render("alerts_game_changed_message", game=info.game_name)]
+        return [self._render("alerts_title_changed_message", title=info.title)]
 
     def _render(self, setting_key: str, **kwargs) -> str:
         template = self.db.get_setting(setting_key, "") or ""

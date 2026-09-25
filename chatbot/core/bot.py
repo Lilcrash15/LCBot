@@ -61,6 +61,13 @@ class Bot:
         self.on_outgoing = on_outgoing or (lambda text, identity: None)
 
         self.twitch_api: Optional[TwitchAPI] = None
+        # Separate from self.twitch_api (which uses the *streamer's*
+        # token): moderation calls (ban/timeout/unban/delete-message)
+        # have to go out under the *bot* account's own token, since
+        # Twitch requires the moderator_id on those calls to be the
+        # token's own owner, and it's the bot that's actually modded in
+        # the channel. See refresh_apis() and _mod_ids() below.
+        self.mod_api: Optional[TwitchAPI] = None
         self.youtube_api: Optional[YouTubeAPI] = None
         # Latest live/viewer-count snapshot, refreshed on the scheduler
         # thread every tick (see _scheduler_loop) so the Dashboard tab
@@ -84,7 +91,7 @@ class Bot:
         self.heist = HeistModule(db)
         self.boss_battle = BossBattleModule(db)
         self.event_system = EventSystemModule(db, sfx_module=self.sfx)
-        self.discord = DiscordNotifier()
+        self.discord = DiscordNotifier(db)
         self.alerts = AlertsModule(db)
         self.engine = CommandEngine(db, resolve_variables=default_variable_resolver)
 
@@ -109,6 +116,15 @@ class Bot:
             self.twitch_api = None
         self.streaminfo.channel = (cfg.channel or self.streaminfo.channel).lower()
         self.streaminfo.set_api(self.twitch_api)
+
+        # The bot's oauth_token is already the same access token Twitch
+        # issued, just formatted "oauth:xxxx" for IRC's PASS line --
+        # TwitchAPI._headers() strips that prefix automatically, so it
+        # doubles as a Helix bearer token with no separate login step.
+        if client_id and cfg.oauth_token:
+            self.mod_api = TwitchAPI(client_id, cfg.oauth_token)
+        else:
+            self.mod_api = None
 
         if cfg.youtube_api_key:
             self.youtube_api = YouTubeAPI(cfg.youtube_api_key)
@@ -249,14 +265,22 @@ class Bot:
         as its own method so it's directly testable without waiting on
         the real scheduler thread's sleep loop. On a failed Twitch call
         the previous snapshot is left in place rather than blanking the
-        Dashboard out over one missed request."""
+        Dashboard out over one missed request.
+
+        Also feeds the same snapshot to AlertsModule.check_stream_info,
+        which is what actually notices a title/game change and hands
+        back a chat message to send -- piggybacking on this existing
+        10s poll rather than adding a second one, since this call
+        already carries the title/game_name a diff needs."""
         cfg = self.config.data
         if not self.twitch_api or not cfg.channel:
             return
         try:
             self.last_stream_info = self.twitch_api.get_stream_info(cfg.channel)
         except TwitchAPIError:
-            pass
+            return
+        for alert_message in self.alerts.check_stream_info(self.last_stream_info):
+            self.send_chat(alert_message)
 
     # -- message pipeline --------------------------------------------
     def _on_message(self, message: ChatMessage) -> None:
@@ -284,13 +308,106 @@ class Bot:
 
     def _apply_moderation(self, message: ChatMessage, action) -> None:
         if action.delete and message.message_id:
-            self.send_chat(f"/delete {message.message_id}")
+            if not self.delete_message(message.message_id):
+                logger.warning(
+                    "couldn't delete message %s via Helix (bot not logged in, or not modded?)",
+                    message.message_id,
+                )
         if action.ban:
-            self.send_chat(f"/ban {message.username} {action.reason}")
+            if not self.ban_user(message.username, reason=action.reason):
+                logger.warning("couldn't ban %s via Helix (bot not logged in, or not modded?)", message.username)
         elif action.timeout_seconds:
-            self.send_chat(f"/timeout {message.username} {action.timeout_seconds} {action.reason}")
+            if not self.timeout_user(message.username, action.timeout_seconds, reason=action.reason):
+                logger.warning(
+                    "couldn't timeout %s via Helix (bot not logged in, or not modded?)", message.username
+                )
         if action.warn_message:
             self.send_chat(action.warn_message)
+
+    # -- moderation (Helix) -------------------------------------------
+    # Twitch retired /timeout, /ban, /delete, /unban as IRC chat
+    # commands -- IRC now just replies "Unrecognized command: ..." for
+    # all of them -- so every moderation action goes out over the Helix
+    # Moderation API instead, using the *bot* account's own token (see
+    # refresh_apis/self.mod_api). Each method below returns True/False
+    # instead of raising, so a moderation failure (bot not logged in
+    # yet, missing scopes, not actually modded in the channel) can't
+    # crash the message pipeline -- it's logged and otherwise ignored,
+    # same as a failed IRC send always was.
+    def _mod_ids(self) -> Optional[tuple[str, str]]:
+        """Resolves (broadcaster_id, moderator_id) for a Helix moderation
+        call. moderator_id is the *bot's* own user ID, not the
+        streamer's -- Twitch requires it to match the token's owner.
+        Returns None if the bot isn't logged in yet or channel/
+        bot_username aren't set."""
+        cfg = self.config.data
+        if not self.mod_api or not cfg.channel or not cfg.bot_username:
+            return None
+        try:
+            broadcaster_id = self.mod_api.get_user_id(cfg.channel)
+            moderator_id = self.mod_api.get_user_id(cfg.bot_username)
+        except TwitchAPIError:
+            return None
+        if not broadcaster_id or not moderator_id:
+            return None
+        return broadcaster_id, moderator_id
+
+    def delete_message(self, message_id: str) -> bool:
+        ids = self._mod_ids()
+        if not ids:
+            return False
+        broadcaster_id, moderator_id = ids
+        try:
+            self.mod_api.delete_chat_message(broadcaster_id, moderator_id, message_id)
+            return True
+        except TwitchAPIError:
+            logger.exception("Helix delete message failed")
+            return False
+
+    def timeout_user(self, username: str, seconds: int, reason: str = "") -> bool:
+        ids = self._mod_ids()
+        if not ids:
+            return False
+        broadcaster_id, moderator_id = ids
+        try:
+            user_id = self.mod_api.get_user_id(username)
+            if not user_id:
+                return False
+            self.mod_api.ban_user(broadcaster_id, moderator_id, user_id, duration=seconds, reason=reason)
+            return True
+        except TwitchAPIError:
+            logger.exception("Helix timeout failed")
+            return False
+
+    def ban_user(self, username: str, reason: str = "") -> bool:
+        ids = self._mod_ids()
+        if not ids:
+            return False
+        broadcaster_id, moderator_id = ids
+        try:
+            user_id = self.mod_api.get_user_id(username)
+            if not user_id:
+                return False
+            self.mod_api.ban_user(broadcaster_id, moderator_id, user_id, reason=reason)
+            return True
+        except TwitchAPIError:
+            logger.exception("Helix ban failed")
+            return False
+
+    def unban_user(self, username: str) -> bool:
+        ids = self._mod_ids()
+        if not ids:
+            return False
+        broadcaster_id, moderator_id = ids
+        try:
+            user_id = self.mod_api.get_user_id(username)
+            if not user_id:
+                return False
+            self.mod_api.unban_user(broadcaster_id, moderator_id, user_id)
+            return True
+        except TwitchAPIError:
+            logger.exception("Helix unban failed")
+            return False
 
     # -- module registration ----------------------------------------
     def _register_modules(self) -> None:
@@ -321,6 +438,11 @@ class Bot:
         self.engine.register_builtin(BuiltinCommand(
             name="delcom", handler=self._cmd_delcom, default_permission="moderator",
             default_cooldown_seconds=1, description="!delcom !name -- remove a custom command.",
+        ))
+        self.engine.register_builtin(BuiltinCommand(
+            name="permit", handler=self._cmd_permit, default_permission="moderator",
+            default_cooldown_seconds=1,
+            description="!permit username -- exempts their next message from every moderation filter.",
         ))
 
     def _cmd_commands(self, ctx: CommandContext) -> str:
@@ -362,6 +484,13 @@ class Bot:
             return f"@{ctx.user} !{name} can't be deleted."
         self.db.delete_command(name)
         return f"Deleted !{name}."
+
+    def _cmd_permit(self, ctx: CommandContext) -> str:
+        if not ctx.args:
+            return f"@{ctx.user} usage: !permit username"
+        target = ctx.target_username()
+        seconds = self.moderation.permit(target)
+        return f"@{target} is permitted -- your next message won't be filtered (next {seconds}s)."
 
     # -- $(...) variable provider --------------------------------------
     def get_variable(self, name: str, arg: Optional[str], ctx: CommandContext) -> Optional[str]:
