@@ -20,3 +20,15 @@ emote_cache/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Build/release helper scripts -- kept out of the public repo on
+# purpose (2026-09-26): GitHub should just have the source and the
+# exe download, not Ryan's own build/publish tooling. Still used
+# locally to actually build and ship releases -- just not tracked.
+build_and_release.bat
+build_exe.bat
+debug_build.bat
+fix_push.bat
+push_update.bat
+release.bat
+setup_github.bat
