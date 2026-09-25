@@ -32,3 +32,4 @@ fix_push.bat
 push_update.bat
 release.bat
 setup_github.bat
+fix_taskbar_icon_cache.bat
