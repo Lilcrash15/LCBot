@@ -5,6 +5,8 @@ All notable changes to LCBot are logged here. Versions follow
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-25
+
 ### Changed
 - **The built exe is now `LCBot.exe`, renamed from `TwitchChatBotV2.exe`.**
   Ryan noticed the exe said "V2" while the actual release tag was
