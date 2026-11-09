@@ -9,6 +9,8 @@ All notable changes to LCBot are logged here. Versions follow
 - **LCBot is now open source under the MIT License.** The old
   all-rights-reserved `LICENSE` is replaced; anyone can use, modify
   and share the code as long as the copyright notice is kept.
+- **The support popup and Help -> Support / buy me a coffee now open
+  Ko-fi** (ko-fi.com/lilcrash15) instead of the Streamlabs tip jar.
 
 ## [1.0.1] - 2026-09-25
 
