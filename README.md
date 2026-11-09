@@ -6,9 +6,9 @@ Runs locally on your PC as a desktop app, no subscription, no cloud
 account, all your data (points, commands, quotes) in a SQLite file
 next to the app.
 
-> **Status**: private, pre-release (`v0.1.0`). This repository isn't
-> open source -- see [`LICENSE`](LICENSE). Compiled Windows builds
-> are published on the [Releases](../../releases) page.
+> **Free and open source** under the [MIT License](LICENSE). No
+> subscriptions, ever. Compiled Windows builds are published on the
+> [Releases](../../releases) page.
 
 ## Features
 
@@ -383,7 +383,7 @@ build_and_release.bat one-click: bump version, build, commit/push, tag, and publ
 _ship_helpers.py      Python helper build_and_release.bat calls for version-number/CHANGELOG edits
 setup_github.bat      one-time: creates the GitHub repo and pushes
 release.bat           tags a version and publishes a GitHub release (no version bump/build -- see build_and_release.bat for the full one-click flow)
-LICENSE               proprietary, all rights reserved (see above)
+LICENSE               MIT License
 CHANGELOG.md          version history
 ```
 
@@ -423,3 +423,9 @@ GitHub release with the exe attached -- all in one run.
 (pushing ordinary code changes that aren't a release), and `release.bat`
 (tag + publish an already-built exe, without the version bump/build
 steps) still exist separately for those narrower cases.
+
+## License
+
+LCBot is released under the [MIT License](LICENSE): you're free to use,
+copy, modify and share it, including in your own projects, as long as
+the copyright notice stays with it.

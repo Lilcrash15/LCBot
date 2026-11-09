@@ -5,6 +5,11 @@ All notable changes to LCBot are logged here. Versions follow
 
 ## [Unreleased]
 
+### Changed
+- **LCBot is now open source under the MIT License.** The old
+  all-rights-reserved `LICENSE` is replaced; anyone can use, modify
+  and share the code as long as the copyright notice is kept.
+
 ## [1.0.1] - 2026-09-25
 
 ### Changed
