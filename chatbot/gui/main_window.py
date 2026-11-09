@@ -89,7 +89,7 @@ REFRESH_MS = 5000
 
 # Ryan's donation/support link -- shown in the startup "buy me a
 # coffee" popup and the Help menu.
-SUPPORT_URL = "https://streamlabs.com/lilcrash15/tip"
+SUPPORT_URL = "https://ko-fi.com/lilcrash15"
 
 
 class MainWindow(tk.Tk):
